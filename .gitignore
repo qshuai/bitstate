@@ -1,0 +1,9 @@
+# private configuration
+config.yml
+
+# binary file
+bitstate
+
+# log files
+logs
+.log
