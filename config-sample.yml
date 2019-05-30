@@ -1,11 +1,12 @@
 bitocin:
-  rpcuser: bitcoind-rpcuser
-  rpcpassword: bitcoind-rpcpassword
-
+  rpc:
+    host: 127.0.0.1:8332
+    user: bitcoind-rpc-user
+    password: bitcoind-rpc-password
 server:
   rpc:
-    rpcuser: your-custom-rpcuser
-    rpcpasswd: your-private-rpcpassword
+    user: your-custom-rpcuser
+    passwd: your-private-rpcpassword
   log:
     level: debug
     log-path: logs
