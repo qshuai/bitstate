@@ -1,6 +1,7 @@
 bitocin:
   rpc:
-    host: 127.0.0.1:8332
+    host: 127.0.0.1
+    port: 8332
     user: bitcoind-rpc-user
     password: bitcoind-rpc-password
 server:
@@ -12,3 +13,6 @@ server:
     log-path: logs
   db:
     dbpath: .data/bitstate.db
+  task:
+    start: 0
+    end: 300000
