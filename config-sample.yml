@@ -1,2 +1,13 @@
-rpcuser=your-custom-username
-rpcpassword=your-custom-rpc-passwd
+bitocin:
+  rpcuser: bitcoind-rpcuser
+  rpcpassword: bitcoind-rpcpassword
+
+server:
+  rpc:
+    rpcuser: your-custom-rpcuser
+    rpcpasswd: your-private-rpcpassword
+  log:
+    level: debug
+    log-path: logs
+  db:
+    dbpath: .data/bitstate.db
