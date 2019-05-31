@@ -25,12 +25,12 @@ const (
 	blockCacheSize = 5
 
 	// cache size
-	utxoCacheSize    = 200000
-	addressCacheSize = 500000
+	utxoCacheSize    = 20
+	addressCacheSize = 50
 
 	// subcache size
-	utxoSubcacheSize    = 10000
-	addressSubcacheSize = 10000
+	utxoSubcacheSize    = 10
+	addressSubcacheSize = 20
 )
 
 var (
@@ -145,7 +145,7 @@ func (s *Server) start() {
 					spend(&txHash, view.entry)
 				} else {
 					// find utxo in secondary cache
-					entry := s.utxoSubcache[hex.EncodeToString(utxoDBKey)]
+					entry := s.utxoSubcache[utxoMapKey]
 					if entry != nil {
 						delete(s.utxoSubcache, utxoMapKey)
 
@@ -154,7 +154,8 @@ func (s *Server) start() {
 						err := s.db.View(func(tx *bbolt.Tx) error {
 							value := tx.Bucket(utxoBucket).Get(utxoDBKey)
 							if value == nil {
-								return errors.New("utxo entry not found in database")
+								return errors.New(fmt.Sprintf("utxo entry not found in database: %s:%d",
+									input.PreviousOutPoint.Hash.String(), input.PreviousOutPoint.Index))
 							}
 
 							return nil
@@ -164,7 +165,7 @@ func (s *Server) start() {
 							return
 						}
 
-						err = s.db.View(func(tx *bbolt.Tx) error {
+						err = s.db.Update(func(tx *bbolt.Tx) error {
 							return tx.Bucket(utxoBucket).Delete(utxoDBKey)
 						})
 						if err != nil {
@@ -215,9 +216,11 @@ func (s *Server) carryUtxoSubcache(entry lru.Item) error {
 	view := entry.(*UtxoViewCache)
 	s.utxoSubcache[view.key] = view.entry
 
+	log.Debug("trigger save utxo entry to subcache")
 	// check whether trigger full cache
 	if len(s.utxoSubcache) >= utxoSubcacheSize {
 		for hashAndIndex, view := range s.utxoSubcache {
+			log.Debugf("save utxo entry to db: %s", hashAndIndex)
 			err := s.db.Update(func(tx *bbolt.Tx) error {
 				key, _ := hex.DecodeString(hashAndIndex)
 				value, err := view.encode()
@@ -225,7 +228,11 @@ func (s *Server) carryUtxoSubcache(entry lru.Item) error {
 					log.Error("Encode utxoview failed:", err)
 					return err
 				}
-				err = tx.Bucket(utxoBucket).Put(key, value)
+				bucket, err := tx.CreateBucketIfNotExists(utxoBucket)
+				if err != nil {
+					return err
+				}
+				err = bucket.Put(key, value)
 				if err != nil {
 					return err
 				}
@@ -236,6 +243,8 @@ func (s *Server) carryUtxoSubcache(entry lru.Item) error {
 				return err
 			}
 		}
+
+		s.utxoSubcache = make(map[string]*UtxoView, utxoSubcacheSize)
 	}
 
 	return nil
@@ -250,7 +259,11 @@ func (s *Server) carryAddressSubcache(entry lru.Item) error {
 		for scriptHex, info := range s.addressSubcache {
 			err := s.db.Update(func(tx *bbolt.Tx) error {
 				key, _ := hex.DecodeString(scriptHex)
-				err := tx.Bucket(utxoBucket).Put(key, info.Encode())
+				bucket, err := tx.CreateBucketIfNotExists(addressBucket)
+				if err != nil {
+					return err
+				}
+				err = bucket.Put(key, info.Encode())
 				if err != nil {
 					return err
 				}
@@ -261,6 +274,8 @@ func (s *Server) carryAddressSubcache(entry lru.Item) error {
 				return err
 			}
 		}
+
+		s.addressSubcache = make(map[string]*AddressBalanceInfo, addressSubcacheSize)
 	}
 
 	return nil
@@ -355,8 +370,8 @@ func NewServer() (*Server, error) {
 		db:              db,
 		rpcBackend:      bc,
 		blockContainer:  make(chan *Block),
-		utxoCache:       lru.New(addressCacheSize, true),
-		addressCache:    lru.New(utxoCacheSize, false),
+		utxoCache:       lru.New(utxoCacheSize, true),
+		addressCache:    lru.New(addressCacheSize, false),
 		utxoSubcache:    make(map[string]*UtxoView, utxoSubcacheSize),
 		addressSubcache: make(map[string]*AddressBalanceInfo, addressSubcacheSize),
 
