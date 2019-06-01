@@ -154,8 +154,8 @@ func (s *Server) start() {
 						err := s.db.View(func(tx *bbolt.Tx) error {
 							value := tx.Bucket(utxoBucket).Get(utxoDBKey)
 							if value == nil {
-								return errors.New(fmt.Sprintf("utxo entry not found in database: %s:%d",
-									input.PreviousOutPoint.Hash.String(), input.PreviousOutPoint.Index))
+								return errors.New(fmt.Sprintf("utxo entry not found in database: %s:%d(%s)",
+									input.PreviousOutPoint.Hash.String(), input.PreviousOutPoint.Index, hex.EncodeToString(utxoDBKey)))
 							}
 
 							return nil
@@ -300,6 +300,28 @@ func generateUtxoKey(txHash *chainhash.Hash, idx uint32) []byte {
 	return buf.Bytes()
 }
 
+func mkDirAndFile(filePath string) error {
+	dir := filepath.Dir(filePath)
+	//filename := filepath.Base(filePath)
+	_, err := os.Stat(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			err = os.Mkdir(dir, os.ModePerm)
+			if err != nil {
+				return err
+			}
+			_, err = os.Create(filePath)
+			if err != nil {
+				return err
+			}
+		} else {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func main() {
 	// read config file
 	viper.SetConfigFile("config.yml")
@@ -346,6 +368,12 @@ func main() {
 }
 
 func NewServer() (*Server, error) {
+	dbFile := viper.GetString("server.db.dbpath")
+	err := mkDirAndFile(dbFile)
+	if err != nil {
+		log.Error("Make db directory or touch db file failed:", err)
+		return nil, err
+	}
 	db, err := bbolt.Open(viper.GetString("server.db.dbpath"), 0600,
 		&bbolt.Options{
 			Timeout:      0,
