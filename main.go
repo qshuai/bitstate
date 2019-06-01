@@ -25,12 +25,12 @@ const (
 	blockCacheSize = 5
 
 	// cache size
-	utxoCacheSize    = 20
-	addressCacheSize = 50
+	utxoCacheSize    = 20000
+	addressCacheSize = 50000
 
 	// subcache size
-	utxoSubcacheSize    = 10
-	addressSubcacheSize = 20
+	utxoSubcacheSize    = 100
+	addressSubcacheSize = 200
 )
 
 var (
@@ -220,7 +220,7 @@ func (s *Server) carryUtxoSubcache(entry lru.Item) error {
 	// check whether trigger full cache
 	if len(s.utxoSubcache) >= utxoSubcacheSize {
 		for hashAndIndex, view := range s.utxoSubcache {
-			log.Debugf("save utxo entry to db: %s", hashAndIndex)
+			log.Debugf("Save utxo entry to db: %s", hashAndIndex)
 			err := s.db.Update(func(tx *bbolt.Tx) error {
 				key, _ := hex.DecodeString(hashAndIndex)
 				value, err := view.encode()
