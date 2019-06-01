@@ -285,11 +285,7 @@ func (s *Server) flushUtxoSubcache() error {
 				log.Error("Encode utxoview failed:", err)
 				return err
 			}
-			bucket, err := tx.CreateBucketIfNotExists(utxoBucket)
-			if err != nil {
-				return err
-			}
-			err = bucket.Put(key, value)
+			err = tx.Bucket(utxoBucket).Put(key, value)
 			if err != nil {
 				return err
 			}
@@ -325,16 +321,7 @@ func (s *Server) flushAddressSubcache() error {
 	for scriptHex, info := range s.addressSubcache {
 		err := s.db.Update(func(tx *bbolt.Tx) error {
 			key, _ := hex.DecodeString(scriptHex)
-			bucket, err := tx.CreateBucketIfNotExists(addressBucket)
-			if err != nil {
-				return err
-			}
-			err = bucket.Put(key, info.Encode())
-			if err != nil {
-				return err
-			}
-
-			return nil
+			return tx.Bucket(addressBucket).Put(key, info.Encode())
 		})
 		if err != nil {
 			return err
@@ -350,20 +337,11 @@ func (s *Server) flushUtxoLRUCache(item lru.Item) error {
 	view := item.(*UtxoViewCache)
 	err := s.db.Update(func(tx *bbolt.Tx) error {
 		key, _ := hex.DecodeString(view.key)
-		bucket, err := tx.CreateBucketIfNotExists(utxoBucket)
-		if err != nil {
-			return err
-		}
 		v, err := view.entry.encode()
 		if err != nil {
 			return err
 		}
-		err = bucket.Put(key, v)
-		if err != nil {
-			return err
-		}
-
-		return nil
+		return tx.Bucket(utxoBucket).Put(key, v)
 	})
 
 	return err
@@ -373,16 +351,7 @@ func (s *Server) flushAddressLRUCache(item lru.Item) error {
 	info := item.(*AddressBalanceInfoCache)
 	err := s.db.Update(func(tx *bbolt.Tx) error {
 		key, _ := hex.DecodeString(info.key)
-		bucket, err := tx.CreateBucketIfNotExists(addressBucket)
-		if err != nil {
-			return err
-		}
-		err = bucket.Put(key, info.entry.Encode())
-		if err != nil {
-			return err
-		}
-
-		return nil
+		return tx.Bucket(addressBucket).Put(key, info.entry.Encode())
 	})
 
 	return err
@@ -517,6 +486,20 @@ func NewServer() (*Server, error) {
 		return nil, err
 	}
 
+	// initialize necessary bucket
+	err = db.Update(func(tx *bbolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists(utxoBucket)
+		if err != nil {
+			return err
+		}
+
+		_, err = tx.CreateBucketIfNotExists(addressBucket)
+		return err
+	})
+	if err != nil {
+		log.Errorf("Create necessary db bucket failed: %s", err)
+	}
+
 	bc, err := bitcoind.New(
 		viper.GetString("bitcoin.rpc.host"),
 		viper.GetInt("bitcoin.rpc.port"),
@@ -530,7 +513,7 @@ func NewServer() (*Server, error) {
 	s := &Server{
 		db:              db,
 		rpcBackend:      bc,
-		blockContainer:  make(chan *Block),
+		blockContainer:  make(chan *Block, blockCacheSize),
 		utxoCache:       lru.New(utxoCacheSize, true),
 		addressCache:    lru.New(addressCacheSize, false),
 		utxoSubcache:    make(map[string]*UtxoView, utxoSubcacheSize),
