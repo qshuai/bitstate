@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sync/atomic"
+	"syscall"
 
 	"github.com/btcsuite/btcd/blockchain"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
@@ -62,47 +64,51 @@ type Server struct {
 	endBlock   int
 
 	closed atomic.Value
+	done   chan bool
+
+	interrupt chan os.Signal
 }
 
 func (s *Server) SyncBlocks() {
+	defer func() {
+		// the channel should be closed by producer
+		close(s.blockContainer)
+
+		log.Debug("Sync block goroutine exit")
+	}()
+
 	for i := s.startBlock; i <= s.endBlock; i++ {
 		if s.closed.Load().(bool) {
-			fmt.Println("has requested shutdown")
-			close(s.blockContainer)
+			log.Info("[block sync]Receiving shutdown requested")
+			s.done <- true
 			return
 		}
 
 		blockHash, err := s.rpcBackend.GetBlockHash(uint64(i))
 		if err != nil {
-			fmt.Printf("get block hash failed: %s", err)
-			close(s.blockContainer)
+			log.Errorf("get block hash failed: %s", err)
 			return
 		}
 
 		rawBlock, err := s.rpcBackend.GetRawBlock(blockHash)
 		if err != nil {
-			fmt.Printf("get block failed: %s", err)
-			close(s.blockContainer)
+			log.Errorf("get block failed: %s", err)
 			return
 		}
 		var block wire.MsgBlock
 		blockBytes, err := hex.DecodeString(rawBlock)
 		if err != nil {
-			fmt.Printf("decode block failed: %s\n", err)
-			close(s.blockContainer)
+			log.Errorf("decode block failed: %s\n", err)
 			return
 		}
 		err = block.Deserialize(bytes.NewReader(blockBytes))
 		if err != nil {
-			fmt.Printf("deserialize block failed: %s\n", err)
-			close(s.blockContainer)
+			log.Errorf("deserialize block failed: %s\n", err)
 			return
 		}
 
 		if err != nil {
-			fmt.Printf("get block failed: %s\n", err)
-			s.closed.Store(true)
-			close(s.blockContainer)
+			log.Errorf("get block failed: %s\n", err)
 			return
 		}
 
@@ -110,10 +116,9 @@ func (s *Server) SyncBlocks() {
 			block:  &block,
 			height: uint32(i),
 		}
-	}
 
-	// the channel should be closed by producer
-	close(s.blockContainer)
+		log.Debugf("Have synced block: %s:%d", block.BlockHash(), i)
+	}
 }
 
 func (s *Server) start() {
@@ -122,6 +127,24 @@ func (s *Server) start() {
 
 	var inputs, outputs int
 	for block := range s.blockContainer {
+		select {
+		case <-s.interrupt:
+			log.Info("Receiving interrupt signal, preparing exit program")
+			// notify block sync goroutine should exit
+			s.closed.Store(true)
+
+			// fetch a entry from block container channel avoiding to block SyncBlocks goroutine
+			<-s.blockContainer
+
+			// wait sync block goroutine exit complete
+			<-s.done
+
+			s.shutdown()
+
+			goto exit
+		default:
+		}
+
 		for _, tx := range block.block.Transactions {
 			inputs += len(tx.TxIn)
 			outputs += len(tx.TxOut)
@@ -203,12 +226,21 @@ func (s *Server) start() {
 		log.Infof("Handle block %s:%d, inputs: %d, outputs: %d",
 			block.block.BlockHash().String(), block.height, inputs, outputs)
 	}
+
+exit:
 }
 
 func (s *Server) shutdown() {
-	err := s.db.Close()
+	log.Info("Flush cache before exiting")
+	err := s.flushCache()
 	if err != nil {
-		log.Error("close bbolt database failed:", err)
+		log.Errorf("flush utxo and address cache failed: %s", err)
+	}
+	log.Info("Flush cache completed!")
+
+	err = s.db.Close()
+	if err != nil {
+		log.Errorf("close bbolt database failed: %s", err)
 	}
 }
 
@@ -216,36 +248,44 @@ func (s *Server) carryUtxoSubcache(entry lru.Item) error {
 	view := entry.(*UtxoViewCache)
 	s.utxoSubcache[view.key] = view.entry
 
-	log.Debug("trigger save utxo entry to subcache")
 	// check whether trigger full cache
 	if len(s.utxoSubcache) >= utxoSubcacheSize {
-		for hashAndIndex, view := range s.utxoSubcache {
-			log.Debugf("Save utxo entry to db: %s", hashAndIndex)
-			err := s.db.Update(func(tx *bbolt.Tx) error {
-				key, _ := hex.DecodeString(hashAndIndex)
-				value, err := view.encode()
-				if err != nil {
-					log.Error("Encode utxoview failed:", err)
-					return err
-				}
-				bucket, err := tx.CreateBucketIfNotExists(utxoBucket)
-				if err != nil {
-					return err
-				}
-				err = bucket.Put(key, value)
-				if err != nil {
-					return err
-				}
+		err := s.flushUtxoSubcache()
+		if err != nil {
+			return err
+		}
+	}
 
-				return nil
-			})
+	return nil
+}
+
+func (s *Server) flushUtxoSubcache() error {
+	for hashAndIndex, view := range s.utxoSubcache {
+		log.Debugf("Save utxo entry to db: %s", hashAndIndex)
+		err := s.db.Update(func(tx *bbolt.Tx) error {
+			key, _ := hex.DecodeString(hashAndIndex)
+			value, err := view.encode()
+			if err != nil {
+				log.Error("Encode utxoview failed:", err)
+				return err
+			}
+			bucket, err := tx.CreateBucketIfNotExists(utxoBucket)
 			if err != nil {
 				return err
 			}
-		}
+			err = bucket.Put(key, value)
+			if err != nil {
+				return err
+			}
 
-		s.utxoSubcache = make(map[string]*UtxoView, utxoSubcacheSize)
+			return nil
+		})
+		if err != nil {
+			return err
+		}
 	}
+
+	s.utxoSubcache = make(map[string]*UtxoView, utxoSubcacheSize)
 
 	return nil
 }
@@ -256,29 +296,99 @@ func (s *Server) carryAddressSubcache(entry lru.Item) error {
 
 	// check whether trigger full cache
 	if len(s.addressSubcache) >= addressSubcacheSize {
-		for scriptHex, info := range s.addressSubcache {
-			err := s.db.Update(func(tx *bbolt.Tx) error {
-				key, _ := hex.DecodeString(scriptHex)
-				bucket, err := tx.CreateBucketIfNotExists(addressBucket)
-				if err != nil {
-					return err
-				}
-				err = bucket.Put(key, info.Encode())
-				if err != nil {
-					return err
-				}
-
-				return nil
-			})
-			if err != nil {
-				return err
-			}
+		err := s.flushAddressSubcache()
+		if err != nil {
+			return err
 		}
-
-		s.addressSubcache = make(map[string]*AddressBalanceInfo, addressSubcacheSize)
 	}
 
 	return nil
+}
+
+func (s *Server) flushAddressSubcache() error {
+	for scriptHex, info := range s.addressSubcache {
+		err := s.db.Update(func(tx *bbolt.Tx) error {
+			key, _ := hex.DecodeString(scriptHex)
+			bucket, err := tx.CreateBucketIfNotExists(addressBucket)
+			if err != nil {
+				return err
+			}
+			err = bucket.Put(key, info.Encode())
+			if err != nil {
+				return err
+			}
+
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+
+	s.addressSubcache = make(map[string]*AddressBalanceInfo, addressSubcacheSize)
+
+	return nil
+}
+
+func (s *Server) flushUtxoLRUCache(item lru.Item) error {
+	view := item.(*UtxoViewCache)
+	err := s.db.Update(func(tx *bbolt.Tx) error {
+		key, _ := hex.DecodeString(view.key)
+		bucket, err := tx.CreateBucketIfNotExists(utxoBucket)
+		if err != nil {
+			return err
+		}
+		v, err := view.entry.encode()
+		if err != nil {
+			return err
+		}
+		err = bucket.Put(key, v)
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+
+	return err
+}
+
+func (s *Server) flushAddressLRUCache(item lru.Item) error {
+	info := item.(*AddressBalanceInfoCache)
+	err := s.db.Update(func(tx *bbolt.Tx) error {
+		key, _ := hex.DecodeString(info.key)
+		bucket, err := tx.CreateBucketIfNotExists(addressBucket)
+		if err != nil {
+			return err
+		}
+		err = bucket.Put(key, info.entry.Encode())
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+
+	return err
+}
+
+func (s *Server) flushCache() error {
+	err := s.flushUtxoSubcache()
+	if err != nil {
+		return err
+	}
+
+	err = s.flushAddressSubcache()
+	if err != nil {
+		return err
+	}
+
+	err = s.utxoCache.Iterate()
+	if err != nil {
+		return err
+	}
+
+	return s.addressCache.Iterate()
 }
 
 func spend(txHash *chainhash.Hash, view *UtxoView) {
@@ -409,10 +519,18 @@ func NewServer() (*Server, error) {
 
 		startBlock: viper.GetInt("server.task.start"),
 		endBlock:   viper.GetInt("server.task.end"),
+
+		done:      make(chan bool, blockCacheSize),
+		interrupt: make(chan os.Signal, 1),
 	}
 	s.closed.Store(false)
 	s.utxoCache.Callback = s.carryUtxoSubcache
 	s.addressCache.Callback = s.carryAddressSubcache
+
+	s.utxoCache.ForEach = s.flushUtxoLRUCache
+	s.addressCache.ForEach = s.flushAddressLRUCache
+
+	signal.Notify(s.interrupt, syscall.SIGINT, syscall.SIGTERM)
 
 	return s, nil
 }
