@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/btcsuite/btcd/blockchain"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
@@ -27,11 +28,11 @@ const (
 	blockCacheSize = 5
 
 	// cache size
-	utxoCacheSize    = 30000
+	utxoCacheSize    = 1200000
 	addressCacheSize = 50000
 
 	// subcache size
-	utxoSubcacheSize    = 1000
+	utxoSubcacheSize    = 10000
 	addressSubcacheSize = 200
 )
 
@@ -40,6 +41,10 @@ var (
 
 	addressBucket = []byte("address")
 	utxoBucket    = []byte("utxo")
+
+	utxoRead  float64 = 0
+	utxoWrite float64 = 0
+	utxoDel   float64 = 0
 )
 
 type Block struct {
@@ -128,6 +133,7 @@ func (s *Server) start() {
 	var inputs, outputs int
 	for block := range s.blockContainer {
 		inputs, outputs = 0, 0
+		utxoRead, utxoWrite, utxoDel = 0, 0, 0
 
 		select {
 		case <-s.interrupt:
@@ -174,6 +180,7 @@ func (s *Server) start() {
 
 						spend(&txHash, entry)
 					} else {
+						start := time.Now()
 						err := s.db.View(func(tx *bbolt.Tx) error {
 							value := tx.Bucket(utxoBucket).Get(utxoDBKey)
 							if value == nil {
@@ -187,7 +194,9 @@ func (s *Server) start() {
 							log.Error("Fetch utxo entry in database failed:", err)
 							return
 						}
+						utxoRead += time.Now().Sub(start).Seconds()
 
+						delStart := time.Now()
 						err = s.db.Update(func(tx *bbolt.Tx) error {
 							return tx.Bucket(utxoBucket).Delete(utxoDBKey)
 						})
@@ -195,6 +204,7 @@ func (s *Server) start() {
 							log.Error("Remove the spent utxo entry failed:", err)
 							return
 						}
+						utxoDel += time.Now().Sub(delStart).Seconds()
 					}
 				}
 			}
@@ -226,8 +236,8 @@ func (s *Server) start() {
 			}
 		}
 
-		log.Infof("Handle block %s:%d, inputs: %d, outputs: %d",
-			block.block.BlockHash().String(), block.height, inputs, outputs)
+		log.Infof("Handle block %s:%d, inputs: %d, outputs: %d, utxo read: %f, utxo write: %f, utxo delete: %f",
+			block.block.BlockHash().String(), block.height, inputs, outputs, utxoRead, utxoWrite, utxoDel)
 	}
 
 exit:
@@ -254,10 +264,12 @@ func (s *Server) carryUtxoSubcache(entry lru.Item) error {
 
 	// check whether trigger full cache
 	if len(s.utxoSubcache) >= utxoSubcacheSize {
+		start := time.Now()
 		err := s.flushUtxoSubcache()
 		if err != nil {
 			return err
 		}
+		utxoWrite += time.Now().Sub(start).Seconds()
 	}
 
 	return nil
