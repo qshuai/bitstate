@@ -26,14 +26,6 @@ const (
 	logFile = "bitstate.log"
 
 	blockCacheSize = 5
-
-	// cache size
-	utxoCacheSize    = 1200000
-	addressCacheSize = 50000
-
-	// subcache size
-	utxoSubcacheSize    = 10000
-	addressSubcacheSize = 200
 )
 
 var (
@@ -41,6 +33,13 @@ var (
 
 	addressBucket = []byte("address")
 	utxoBucket    = []byte("utxo")
+
+	// cache size default value
+	utxoCacheSize    = 1200000
+	addressCacheSize = 50000
+	// subcache size default value
+	utxoSubcacheSize    = 10000
+	addressSubcacheSize = 200
 
 	utxoRead  float64 = 0
 	utxoWrite float64 = 0
@@ -397,7 +396,6 @@ func generateUtxoKey(txHash *chainhash.Hash, idx uint32) []byte {
 
 func mkDirAndFile(filePath string) error {
 	dir := filepath.Dir(filePath)
-	//filename := filepath.Base(filePath)
 	_, err := os.Stat(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -509,6 +507,11 @@ func NewServer() (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	utxoCacheSize = viper.GetInt("server.cache.utxo")
+	addressCacheSize = viper.GetInt("server.cache.address")
+	utxoSubcacheSize = viper.GetInt("server.cache.utxo-sub")
+	addressSubcacheSize = viper.GetInt("server.cache.address-sub")
 
 	s := &Server{
 		db:              db,
