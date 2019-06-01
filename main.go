@@ -27,11 +27,11 @@ const (
 	blockCacheSize = 5
 
 	// cache size
-	utxoCacheSize    = 20000
+	utxoCacheSize    = 30000
 	addressCacheSize = 50000
 
 	// subcache size
-	utxoSubcacheSize    = 100
+	utxoSubcacheSize    = 1000
 	addressSubcacheSize = 200
 )
 
@@ -141,8 +141,6 @@ func (s *Server) start() {
 			// wait sync block goroutine exit complete
 			<-s.done
 
-			s.shutdown()
-
 			goto exit
 		default:
 		}
@@ -165,7 +163,7 @@ func (s *Server) start() {
 				// find utxo in primary cache
 				if cacheEntry != nil {
 					view := cacheEntry.(*UtxoViewCache)
-					s.utxoCache.Remove(view.GetKey())
+					s.utxoCache.Remove(utxoMapKey)
 
 					spend(&txHash, view.entry)
 				} else {
@@ -221,6 +219,9 @@ func (s *Server) start() {
 					return
 				}
 
+				log.Debugf("Save utxo entry to primary cache: %s",
+					hex.EncodeToString(generateUtxoKey(&txHash, uint32(idx))))
+
 				receive(&txHash, output)
 			}
 		}
@@ -249,6 +250,7 @@ func (s *Server) shutdown() {
 func (s *Server) carryUtxoSubcache(entry lru.Item) error {
 	view := entry.(*UtxoViewCache)
 	s.utxoSubcache[view.key] = view.entry
+	log.Debugf("Save utxo entry to secondary cache: %s", view.key)
 
 	// check whether trigger full cache
 	if len(s.utxoSubcache) >= utxoSubcacheSize {
@@ -481,6 +483,9 @@ func main() {
 	}
 
 	server.start()
+
+	// finally flush all cache and close database
+	server.shutdown()
 }
 
 func NewServer() (*Server, error) {

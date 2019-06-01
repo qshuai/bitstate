@@ -41,11 +41,11 @@ func PutUint64(v uint64) []byte {
 
 func CompressedUint32(v uint32) []byte {
 	b := PutUint32(v)
-	for i := range b {
-		if b[i] == 0 {
-			return b[0:i]
+	for i := len(b) - 1; i >= 0; i-- {
+		if b[i] != 0 {
+			return b[0 : i+1]
 		}
 	}
 
-	return b
+	return []byte{}
 }
