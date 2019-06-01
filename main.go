@@ -127,6 +127,8 @@ func (s *Server) start() {
 
 	var inputs, outputs int
 	for block := range s.blockContainer {
+		inputs, outputs = 0, 0
+
 		select {
 		case <-s.interrupt:
 			log.Info("Receiving interrupt signal, preparing exit program")
