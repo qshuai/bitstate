@@ -354,7 +354,11 @@ func main() {
 		return
 	}
 	log = btclog.NewBackend(file).Logger("")
-	level, _ := btclog.LevelFromString("server.log.level")
+	levelConf := viper.GetString("server.log.level")
+	level, ok := btclog.LevelFromString(levelConf)
+	if !ok {
+		log.Warnf("Set log level failed, want: %s, but current log level is: %s", levelConf, level)
+	}
 	log.SetLevel(level)
 
 	// get server instance
