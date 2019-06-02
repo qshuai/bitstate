@@ -17,7 +17,7 @@ type UtxoView struct {
 
 func (view *UtxoView) encode() ([]byte, error) {
 	varLen := wire.VarIntSerializeSize(uint64(len(view.pkScript)))
-	container := make([]byte, 4+8+1+varLen+len(view.pkScript))
+	container := make([]byte, 0, 4+8+1+varLen+len(view.pkScript))
 
 	w := bytes.NewBuffer(container)
 	w.Write(PutUint32(view.compactCoinbaseAndHeight()))
@@ -36,7 +36,7 @@ func (view *UtxoView) encode() ([]byte, error) {
 	return w.Bytes(), nil
 }
 
-func (view *UtxoView) decode(value []byte) (*UtxoView, error) {
+func (view *UtxoView) decode(value []byte) error {
 	coinbaseAndHeight := binary.LittleEndian.Uint32(value[0:4])
 	amount := binary.LittleEndian.Uint64(value[4:12])
 
@@ -44,16 +44,16 @@ func (view *UtxoView) decode(value []byte) (*UtxoView, error) {
 	r := bytes.NewReader(value[13:])
 	length, err := wire.ReadVarInt(r, 0)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	return &UtxoView{
-		isFromCoinbase: coinbaseAndHeight&0x01 == 1,
-		height:         coinbaseAndHeight / 2,
-		amount:         int64(amount),
-		spent:          value[12] == 1,
-		pkScript:       value[13+wire.VarIntSerializeSize(length):],
-	}, nil
+	view.isFromCoinbase = coinbaseAndHeight&0x01 == 1
+	view.height = coinbaseAndHeight / 2
+	view.amount = int64(amount)
+	view.spent = value[12] == 1
+	view.pkScript = value[13+wire.VarIntSerializeSize(length):]
+
+	return nil
 }
 
 func (view *UtxoView) compactCoinbaseAndHeight() uint32 {

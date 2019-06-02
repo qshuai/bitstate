@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -44,6 +45,8 @@ var (
 	utxoRead  float64 = 0
 	utxoWrite float64 = 0
 	utxoDel   float64 = 0
+
+	dummyScript = []byte{0, 0, 0, 0}
 )
 
 type Block struct {
@@ -63,6 +66,10 @@ type Server struct {
 	// subcache, received from lru
 	utxoSubcache    map[string]*UtxoView
 	addressSubcache map[string]*AddressBalanceInfo
+
+	// block header cache
+	mtx     sync.Mutex
+	headers map[uint32]*bitcoind.BlockHeader
 
 	startBlock int
 	endBlock   int
@@ -93,6 +100,16 @@ func (s *Server) SyncBlocks() {
 			log.Errorf("get block hash failed: %s", err)
 			return
 		}
+
+		// for block header cache
+		blockheader, err := s.rpcBackend.GetBlockheader(blockHash)
+		if err != nil {
+			log.Errorf("get block header failed: %s", err)
+			return
+		}
+		s.mtx.Lock()
+		s.headers[uint32(i)] = blockheader
+		s.mtx.Unlock()
 
 		rawBlock, err := s.rpcBackend.GetRawBlock(blockHash)
 		if err != nil {
@@ -154,57 +171,23 @@ func (s *Server) start() {
 			inputs += len(tx.TxIn)
 			outputs += len(tx.TxOut)
 
+			payment, viewCache, err := s.FetchPayment(tx)
+			if err != nil {
+				log.Errorf("Fetch payment information failed: %s", err)
+				return
+			}
 			txHash := tx.TxHash()
-			for _, input := range tx.TxIn {
+			for idx := 0; idx < len(tx.TxIn); idx++ {
 				// coinbase transaction input does not spent any utxo and impact any address balance.
 				// so skip the coinbase transaction input.
 				if blockchain.IsCoinBaseTx(tx) {
 					break
 				}
 
-				utxoDBKey := generateUtxoKey(&input.PreviousOutPoint.Hash, input.PreviousOutPoint.Index)
-				utxoMapKey := hex.EncodeToString(utxoDBKey)
-				cacheEntry := s.utxoCache.Get(utxoMapKey)
-				// find utxo in primary cache
-				if cacheEntry != nil {
-					view := cacheEntry.(*UtxoViewCache)
-					s.utxoCache.Remove(utxoMapKey)
-
-					spend(&txHash, view.entry)
-				} else {
-					// find utxo in secondary cache
-					entry := s.utxoSubcache[utxoMapKey]
-					if entry != nil {
-						delete(s.utxoSubcache, utxoMapKey)
-
-						spend(&txHash, entry)
-					} else {
-						start := time.Now()
-						err := s.db.View(func(tx *bbolt.Tx) error {
-							value := tx.Bucket(utxoBucket).Get(utxoDBKey)
-							if value == nil {
-								return errors.New(fmt.Sprintf("utxo entry not found in database: %s:%d(%s)",
-									input.PreviousOutPoint.Hash.String(), input.PreviousOutPoint.Index, hex.EncodeToString(utxoDBKey)))
-							}
-
-							return nil
-						})
-						if err != nil {
-							log.Error("Fetch utxo entry in database failed:", err)
-							return
-						}
-						utxoRead += time.Now().Sub(start).Seconds()
-
-						delStart := time.Now()
-						err = s.db.Update(func(tx *bbolt.Tx) error {
-							return tx.Bucket(utxoBucket).Delete(utxoDBKey)
-						})
-						if err != nil {
-							log.Error("Remove the spent utxo entry failed:", err)
-							return
-						}
-						utxoDel += time.Now().Sub(delStart).Seconds()
-					}
+				err := s.spend(&txHash, viewCache[idx], payment)
+				if err != nil {
+					log.Errorf("spend coin failed, input: %s:%d, reason: %s", txHash.String(), idx, err)
+					return
 				}
 			}
 
@@ -213,15 +196,16 @@ func (s *Server) start() {
 					continue
 				}
 
+				view := &UtxoView{
+					isFromCoinbase: blockchain.IsCoinBaseTx(tx),
+					height:         block.height,
+					amount:         output.Value,
+					spent:          false,
+					pkScript:       output.PkScript,
+				}
 				err := s.utxoCache.Add(&UtxoViewCache{
-					key: hex.EncodeToString(generateUtxoKey(&txHash, uint32(idx))),
-					entry: &UtxoView{
-						isFromCoinbase: blockchain.IsCoinBaseTx(tx),
-						height:         block.height,
-						amount:         output.Value,
-						spent:          false,
-						pkScript:       output.PkScript,
-					},
+					key:   hex.EncodeToString(generateUtxoKey(&txHash, uint32(idx))),
+					entry: view,
 				})
 				if err != nil {
 					log.Error("Add utxo entry to cache failed:", err)
@@ -231,7 +215,11 @@ func (s *Server) start() {
 				log.Debugf("Save utxo entry to primary cache: %s",
 					hex.EncodeToString(generateUtxoKey(&txHash, uint32(idx))))
 
-				receive(&txHash, output)
+				err = s.receive(&txHash, view, payment)
+				if err != nil {
+					log.Errorf("receiving coin failed, output: %s:%d, reason: %s", txHash.String(), idx, err)
+					return
+				}
 			}
 		}
 
@@ -240,6 +228,131 @@ func (s *Server) start() {
 	}
 
 exit:
+}
+
+// FetchPayment aims to get incoming and outgoings for a single bitcoin address.
+// It must handle the situation a same address in input and output and a same
+// address in input or output at the same time.
+// The amount will be a positive number if an address receiving some coin. On
+// the contrary, the amount will be a negative number if an address spending some
+// coin.
+func (s *Server) FetchPayment(tx *wire.MsgTx) (map[string]int64, []*UtxoView, error) {
+	payment := make(map[string]int64)
+	viewCache := make([]*UtxoView, len(tx.TxIn))
+
+	// as to transaction input, we should fetch utxo information firstly
+	for idx, input := range tx.TxIn {
+		if blockchain.IsCoinBaseTx(tx) {
+			break
+		}
+
+		view, err := s.fetchUtxo(input)
+		if err != nil {
+			return nil, nil, errors.New("Fetch utxo failed: " + err.Error())
+		}
+
+		// cache fetched utxoview
+		viewCache[idx] = view
+
+		scripts, err := generateCanonicalScript(getSafeScript(view.pkScript))
+		if err != nil {
+			return nil, nil, err
+		}
+
+		// hexadecimal encoding as key
+		for _, script := range scripts {
+			key := hex.EncodeToString(script)
+
+			// spend coin
+			if amount, ok := payment[key]; ok {
+				payment[key] = amount - view.amount
+			} else {
+				payment[key] = view.amount
+			}
+		}
+	}
+
+	for _, output := range tx.TxOut {
+		scripts, err := generateCanonicalScript(output.PkScript)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		// hexadecimal encoding as key
+		for _, script := range scripts {
+			key := hex.EncodeToString(script)
+
+			// spend coin
+			if amount, ok := payment[key]; ok {
+				payment[key] = amount + output.Value
+			} else {
+				payment[key] = output.Value
+			}
+		}
+	}
+
+	return payment, viewCache, nil
+}
+
+func (s *Server) fetchUtxo(input *wire.TxIn) (*UtxoView, error) {
+	outpoint := input.PreviousOutPoint
+
+	utxoDBKey := generateUtxoKey(&outpoint.Hash, outpoint.Index)
+	utxoMapKey := hex.EncodeToString(utxoDBKey)
+	cacheEntry := s.utxoCache.Get(utxoMapKey)
+	// find utxo in primary cache
+	if cacheEntry != nil {
+		view := cacheEntry.(*UtxoViewCache)
+		s.utxoCache.Remove(utxoMapKey)
+
+		return view.entry, nil
+	} else {
+		// find utxo in secondary cache
+		entry := s.utxoSubcache[utxoMapKey]
+		if entry != nil {
+			delete(s.utxoSubcache, utxoMapKey)
+
+			return entry, nil
+		} else {
+			var vCopy []byte
+			start := time.Now()
+			err := s.db.View(func(tx *bbolt.Tx) error {
+				value := tx.Bucket(utxoBucket).Get(utxoDBKey)
+				if value == nil {
+					return errors.New(fmt.Sprintf("utxo entry not found in database: %s:%d(%s)",
+						outpoint.Hash.String(), outpoint.Index, hex.EncodeToString(utxoDBKey)))
+				}
+
+				// copy the db entry value in this transaction
+				vCopy = make([]byte, len(value))
+				copy(vCopy, value)
+
+				return nil
+			})
+			if err != nil {
+				return nil, err
+			}
+			utxoRead += time.Now().Sub(start).Seconds()
+
+			// return the utxo result to caller
+			var entry UtxoView
+			err = entry.decode(vCopy)
+			if err != nil {
+				return nil, err
+			}
+
+			delStart := time.Now()
+			err = s.db.Update(func(tx *bbolt.Tx) error {
+				return tx.Bucket(utxoBucket).Delete(utxoDBKey)
+			})
+			if err != nil {
+				return nil, err
+			}
+			utxoDel += time.Now().Sub(delStart).Seconds()
+
+			return &entry, nil
+		}
+	}
 }
 
 func (s *Server) shutdown() {
@@ -375,12 +488,233 @@ func (s *Server) flushCache() error {
 	return s.addressCache.Iterate()
 }
 
-func spend(txHash *chainhash.Hash, view *UtxoView) {
+func (s *Server) spend(txHash *chainhash.Hash, view *UtxoView, payment map[string]int64) error {
+	scripts, err := generateCanonicalScript(getSafeScript(view.pkScript))
+	if err != nil {
+		return err
+	}
 
+	for _, script := range scripts {
+		cacheKey := generateAddressKey(script)
+
+		// get payment information
+		amountDiff, ok := payment[hex.EncodeToString(script)]
+		if !ok {
+			return errors.New("payment information absent for address: " +
+				hex.EncodeToString(getSafeScript(view.pkScript)) + ":" +
+				hex.EncodeToString(script))
+		}
+
+		infoCache := s.addressCache.Get(cacheKey)
+		if infoCache != nil {
+			info := infoCache.(*AddressBalanceInfoCache).entry
+
+			// update info
+			err := s.spendCoin(txHash, view, amountDiff, info)
+			if err != nil {
+				return err
+			}
+		} else {
+			// search in secondary cache
+			info, ok := s.addressSubcache[cacheKey]
+			if ok {
+				err := s.spendCoin(txHash, view, amountDiff, info)
+				if err != nil {
+					return err
+				}
+
+				// move to primary cache from secondary cache
+				delete(s.addressSubcache, cacheKey)
+
+				err = s.addressCache.Add(&AddressBalanceInfoCache{
+					key:   cacheKey,
+					entry: info,
+				})
+				if err != nil {
+					return err
+				}
+			} else {
+				// search from backend database
+				var vCopy []byte
+				err := s.db.View(func(tx *bbolt.Tx) error {
+					value := tx.Bucket(addressBucket).Get(script)
+					if value == nil {
+						return errors.New("address entry not found: " + cacheKey)
+					}
+
+					vCopy = make([]byte, len(value))
+					copy(vCopy, value)
+
+					return nil
+				})
+				if err != nil {
+					return err
+				}
+
+				var info AddressBalanceInfo
+				info.Decode(vCopy)
+
+				err = s.spendCoin(txHash, view, amountDiff, &info)
+				if err != nil {
+					return err
+				}
+
+				// push back to primary cache
+				err = s.addressCache.Add(&AddressBalanceInfoCache{
+					key:   cacheKey,
+					entry: &info,
+				})
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return nil
 }
 
-func receive(txHash *chainhash.Hash, output *wire.TxOut) {
+func (s *Server) spendCoin(txHash *chainhash.Hash, view *UtxoView, amountDiff int64, info *AddressBalanceInfo) error {
+	if info.bestTxHash != txHash.String() {
+		// update tx count and send/receive fields when meeting a different transaction
+		info.txes++
+		if amountDiff < 0 {
+			info.send -= amountDiff
+		}
 
+		info.bestTxHash = txHash.String()
+	}
+
+	s.mtx.Lock()
+	info.updated = uint32(s.headers[view.height].Time)
+	s.mtx.Unlock()
+	info.unspentTxes--
+
+	return nil
+}
+
+func (s *Server) receive(txHash *chainhash.Hash, view *UtxoView, payment map[string]int64) error {
+	scripts, err := generateCanonicalScript(getSafeScript(view.pkScript))
+	if err != nil {
+		return err
+	}
+
+	for _, script := range scripts {
+		cacheKey := generateAddressKey(script)
+
+		// get payment information
+		amountDiff, ok := payment[hex.EncodeToString(script)]
+		if !ok {
+			return errors.New("payment information absent for address: " +
+				hex.EncodeToString(getSafeScript(view.pkScript)) + ":" +
+				hex.EncodeToString(script))
+		}
+
+		infoCache := s.addressCache.Get(cacheKey)
+		if infoCache != nil {
+			info := infoCache.(*AddressBalanceInfoCache).entry
+
+			// update info
+			err := s.receiveCoin(txHash, view, amountDiff, info)
+			if err != nil {
+				return err
+			}
+		} else {
+			// search in secondary cache
+			info, ok := s.addressSubcache[cacheKey]
+			if ok {
+				err := s.receiveCoin(txHash, view, amountDiff, info)
+				if err != nil {
+					return err
+				}
+
+				// move to primary cache from secondary cache
+				delete(s.addressSubcache, cacheKey)
+
+				err = s.addressCache.Add(&AddressBalanceInfoCache{
+					key:   cacheKey,
+					entry: info,
+				})
+				if err != nil {
+					return err
+				}
+			} else {
+				// search from backend database
+				var vCopy []byte
+				err := s.db.View(func(tx *bbolt.Tx) error {
+					value := tx.Bucket(addressBucket).Get(script)
+					// receiving coin first time
+					if value != nil {
+						vCopy = make([]byte, len(value))
+						copy(vCopy, value)
+					}
+
+					return nil
+				})
+				if err != nil {
+					return err
+				}
+
+				if vCopy != nil {
+					var info AddressBalanceInfo
+					info.Decode(vCopy)
+
+					err = s.receiveCoin(txHash, view, amountDiff, &info)
+					if err != nil {
+						return err
+					}
+
+					// push back to primary cache
+					err = s.addressCache.Add(&AddressBalanceInfoCache{
+						key:   cacheKey,
+						entry: &info,
+					})
+					if err != nil {
+						return err
+					}
+				} else {
+					// Now turn out the address is a new one
+					s.mtx.Lock()
+					err = s.addressCache.Add(&AddressBalanceInfoCache{
+						key: cacheKey,
+						entry: &AddressBalanceInfo{
+							received:    view.amount,
+							txes:        1,
+							unspentTxes: 1,
+							created:     uint32(s.headers[view.height].Time),
+							updated:     uint32(s.headers[view.height].Time),
+							bestTxHash:  txHash.String(),
+						},
+					})
+					s.mtx.Unlock()
+					if err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func (s *Server) receiveCoin(txHash *chainhash.Hash, view *UtxoView, amountDiff int64, info *AddressBalanceInfo) error {
+	if info.bestTxHash != txHash.String() {
+		info.txes++
+		// when a address receiving the first coin, the create field should be maintained by method caller.
+		if amountDiff > 0 {
+			info.received += amountDiff
+		}
+
+		info.bestTxHash = txHash.String()
+	}
+
+	s.mtx.Lock()
+	info.updated = uint32(s.headers[view.height].Time)
+	s.mtx.Unlock()
+	info.unspentTxes++
+
+	return nil
 }
 
 func generateUtxoKey(txHash *chainhash.Hash, idx uint32) []byte {
@@ -392,6 +726,18 @@ func generateUtxoKey(txHash *chainhash.Hash, idx uint32) []byte {
 	buf.Write(index)
 
 	return buf.Bytes()
+}
+
+func generateAddressKey(script []byte) string {
+	return hex.EncodeToString(getSafeScript(script))
+}
+
+func getSafeScript(script []byte) []byte {
+	if script == nil || len(script) == 0 {
+		return dummyScript
+	}
+
+	return script
 }
 
 func mkDirAndFile(filePath string) error {
@@ -534,6 +880,8 @@ func NewServer() (*Server, error) {
 
 	s.utxoCache.ForEach = s.flushUtxoLRUCache
 	s.addressCache.ForEach = s.flushAddressLRUCache
+
+	s.headers = make(map[uint32]*bitcoind.BlockHeader)
 
 	signal.Notify(s.interrupt, syscall.SIGINT, syscall.SIGTERM)
 
