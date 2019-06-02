@@ -39,9 +39,17 @@ var (
 	utxoCacheSize    = 1200000
 	addressCacheSize = 50000
 
-	utxoRead  float64 = 0
-	utxoWrite float64 = 0
-	utxoDel   float64 = 0
+	utxoReadCount  int     = 0
+	utxoRead       float64 = 0
+	utxoWriteCount         = 0
+	utxoWrite      float64 = 0
+	utxoDelCount           = 0
+	utxoDel        float64 = 0
+
+	addressReadCount  int     = 0
+	addressRead       float64 = 0
+	addressWriteCount int     = 0
+	addressWrite      float64 = 0
 
 	dummyScript = []byte{0, 0, 0, 0}
 )
@@ -142,7 +150,11 @@ func (s *Server) start() {
 	var inputs, outputs int
 	for block := range s.blockContainer {
 		inputs, outputs = 0, 0
+
+		utxoReadCount, utxoWriteCount, utxoDelCount = 0, 0, 0
 		utxoRead, utxoWrite, utxoDel = 0, 0, 0
+		addressReadCount, addressWriteCount = 0, 0
+		addressRead, addressWrite = 0, 0
 
 		select {
 		case <-s.interrupt:
@@ -216,8 +228,9 @@ func (s *Server) start() {
 			}
 		}
 
-		log.Infof("Handle block %s:%d, inputs: %d, outputs: %d, utxo read: %f, utxo write: %f, utxo delete: %f",
-			block.block.BlockHash().String(), block.height, inputs, outputs, utxoRead, utxoWrite, utxoDel)
+		log.Infof("Handle block %s:%d, inputs: %d, outputs: %d, utxo read: %f(%d), utxo write: %f(%d), utxo delete: %f(%d), "+
+			"address read: %f(%d) address write: %f(%d)", block.block.BlockHash().String(), block.height, inputs, outputs, utxoRead,
+			utxoReadCount, utxoWrite, utxoWriteCount, utxoDel, utxoDelCount, addressRead, addressReadCount, addressWrite, addressWriteCount)
 	}
 
 exit:
@@ -301,6 +314,7 @@ func (s *Server) fetchUtxo(input *wire.TxIn) (*UtxoView, error) {
 	} else {
 		var vCopy []byte
 		start := time.Now()
+		utxoReadCount++
 		err := s.db.View(func(tx *bbolt.Tx) error {
 			value := tx.Bucket(utxoBucket).Get(utxoDBKey)
 			if value == nil {
@@ -327,6 +341,7 @@ func (s *Server) fetchUtxo(input *wire.TxIn) (*UtxoView, error) {
 		}
 
 		delStart := time.Now()
+		utxoDelCount++
 		err = s.db.Update(func(tx *bbolt.Tx) error {
 			return tx.Bucket(utxoBucket).Delete(utxoDBKey)
 		})
@@ -356,6 +371,8 @@ func (s *Server) shutdown() {
 func (s *Server) carryUtxoCache(entry lru.Item) error {
 	view := entry.(*UtxoViewCache)
 
+	utxoWriteCount++
+	start := time.Now()
 	err := s.db.Update(func(tx *bbolt.Tx) error {
 		key, _ := hex.DecodeString(view.key)
 		value, err := view.entry.encode()
@@ -373,6 +390,7 @@ func (s *Server) carryUtxoCache(entry lru.Item) error {
 	if err != nil {
 		return err
 	}
+	utxoWrite += time.Now().Sub(start).Seconds()
 
 	return nil
 }
@@ -380,6 +398,8 @@ func (s *Server) carryUtxoCache(entry lru.Item) error {
 func (s *Server) carryAddressCache(entry lru.Item) error {
 	info := entry.(*AddressBalanceInfoCache)
 
+	addressWriteCount++
+	start := time.Now()
 	err := s.db.Update(func(tx *bbolt.Tx) error {
 		key, _ := hex.DecodeString(info.key)
 		value := info.entry.Encode()
@@ -393,6 +413,7 @@ func (s *Server) carryAddressCache(entry lru.Item) error {
 	if err != nil {
 		return err
 	}
+	addressWrite += time.Now().Sub(start).Seconds()
 
 	return nil
 }
@@ -459,6 +480,8 @@ func (s *Server) spend(txHash *chainhash.Hash, view *UtxoView, payment map[strin
 		} else {
 			// search from backend database
 			var vCopy []byte
+			addressReadCount++
+			start := time.Now()
 			err := s.db.View(func(tx *bbolt.Tx) error {
 				value := tx.Bucket(addressBucket).Get(script)
 				if value == nil {
@@ -473,6 +496,7 @@ func (s *Server) spend(txHash *chainhash.Hash, view *UtxoView, payment map[strin
 			if err != nil {
 				return err
 			}
+			addressRead += time.Now().Sub(start).Seconds()
 
 			var info AddressBalanceInfo
 			info.Decode(vCopy)
@@ -544,6 +568,8 @@ func (s *Server) receive(txHash *chainhash.Hash, view *UtxoView, payment map[str
 
 			// search from backend database
 			var vCopy []byte
+			addressReadCount++
+			start := time.Now()
 			err := s.db.View(func(tx *bbolt.Tx) error {
 				value := tx.Bucket(addressBucket).Get(script)
 				// receiving coin first time
@@ -557,6 +583,7 @@ func (s *Server) receive(txHash *chainhash.Hash, view *UtxoView, payment map[str
 			if err != nil {
 				return err
 			}
+			addressRead += time.Now().Sub(start).Seconds()
 
 			if vCopy != nil {
 				var info AddressBalanceInfo
