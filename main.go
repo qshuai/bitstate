@@ -38,9 +38,6 @@ var (
 	// cache size default value
 	utxoCacheSize    = 1200000
 	addressCacheSize = 50000
-	// subcache size default value
-	utxoSubcacheSize    = 10000
-	addressSubcacheSize = 200
 
 	utxoRead  float64 = 0
 	utxoWrite float64 = 0
@@ -62,10 +59,6 @@ type Server struct {
 	// cache
 	utxoCache    *lru.Cache
 	addressCache *lru.Cache
-
-	// subcache, received from lru
-	utxoSubcache    map[string]*UtxoView
-	addressSubcache map[string]*AddressBalanceInfo
 
 	// block header cache
 	mtx     sync.Mutex
@@ -212,7 +205,7 @@ func (s *Server) start() {
 					return
 				}
 
-				log.Debugf("Save utxo entry to primary cache: %s",
+				log.Debugf("Save utxo entry to cache: %s",
 					hex.EncodeToString(generateUtxoKey(&txHash, uint32(idx))))
 
 				err = s.receive(&txHash, view, payment)
@@ -300,58 +293,49 @@ func (s *Server) fetchUtxo(input *wire.TxIn) (*UtxoView, error) {
 	utxoDBKey := generateUtxoKey(&outpoint.Hash, outpoint.Index)
 	utxoMapKey := hex.EncodeToString(utxoDBKey)
 	cacheEntry := s.utxoCache.Get(utxoMapKey)
-	// find utxo in primary cache
 	if cacheEntry != nil {
 		view := cacheEntry.(*UtxoViewCache)
 		s.utxoCache.Remove(utxoMapKey)
 
 		return view.entry, nil
 	} else {
-		// find utxo in secondary cache
-		entry := s.utxoSubcache[utxoMapKey]
-		if entry != nil {
-			delete(s.utxoSubcache, utxoMapKey)
-
-			return entry, nil
-		} else {
-			var vCopy []byte
-			start := time.Now()
-			err := s.db.View(func(tx *bbolt.Tx) error {
-				value := tx.Bucket(utxoBucket).Get(utxoDBKey)
-				if value == nil {
-					return errors.New(fmt.Sprintf("utxo entry not found in database: %s:%d(%s)",
-						outpoint.Hash.String(), outpoint.Index, hex.EncodeToString(utxoDBKey)))
-				}
-
-				// copy the db entry value in this transaction
-				vCopy = make([]byte, len(value))
-				copy(vCopy, value)
-
-				return nil
-			})
-			if err != nil {
-				return nil, err
-			}
-			utxoRead += time.Now().Sub(start).Seconds()
-
-			// return the utxo result to caller
-			var entry UtxoView
-			err = entry.decode(vCopy)
-			if err != nil {
-				return nil, err
+		var vCopy []byte
+		start := time.Now()
+		err := s.db.View(func(tx *bbolt.Tx) error {
+			value := tx.Bucket(utxoBucket).Get(utxoDBKey)
+			if value == nil {
+				return errors.New(fmt.Sprintf("utxo entry not found in database: %s:%d(%s)",
+					outpoint.Hash.String(), outpoint.Index, hex.EncodeToString(utxoDBKey)))
 			}
 
-			delStart := time.Now()
-			err = s.db.Update(func(tx *bbolt.Tx) error {
-				return tx.Bucket(utxoBucket).Delete(utxoDBKey)
-			})
-			if err != nil {
-				return nil, err
-			}
-			utxoDel += time.Now().Sub(delStart).Seconds()
+			// copy the db entry value in this transaction
+			vCopy = make([]byte, len(value))
+			copy(vCopy, value)
 
-			return &entry, nil
+			return nil
+		})
+		if err != nil {
+			return nil, err
 		}
+		utxoRead += time.Now().Sub(start).Seconds()
+
+		// return the utxo result to caller
+		var entry UtxoView
+		err = entry.decode(vCopy)
+		if err != nil {
+			return nil, err
+		}
+
+		delStart := time.Now()
+		err = s.db.Update(func(tx *bbolt.Tx) error {
+			return tx.Bucket(utxoBucket).Delete(utxoDBKey)
+		})
+		if err != nil {
+			return nil, err
+		}
+		utxoDel += time.Now().Sub(delStart).Seconds()
+
+		return &entry, nil
 	}
 }
 
@@ -369,78 +353,46 @@ func (s *Server) shutdown() {
 	}
 }
 
-func (s *Server) carryUtxoSubcache(entry lru.Item) error {
+func (s *Server) carryUtxoCache(entry lru.Item) error {
 	view := entry.(*UtxoViewCache)
-	s.utxoSubcache[view.key] = view.entry
-	log.Debugf("Save utxo entry to secondary cache: %s", view.key)
 
-	// check whether trigger full cache
-	if len(s.utxoSubcache) >= utxoSubcacheSize {
-		start := time.Now()
-		err := s.flushUtxoSubcache()
+	err := s.db.Update(func(tx *bbolt.Tx) error {
+		key, _ := hex.DecodeString(view.key)
+		value, err := view.entry.encode()
+		if err != nil {
+			log.Error("Encode utxoview failed:", err)
+			return err
+		}
+		err = tx.Bucket(utxoBucket).Put(key, value)
 		if err != nil {
 			return err
 		}
-		utxoWrite += time.Now().Sub(start).Seconds()
+
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 
 	return nil
 }
 
-func (s *Server) flushUtxoSubcache() error {
-	for hashAndIndex, view := range s.utxoSubcache {
-		log.Debugf("Save utxo entry to db: %s", hashAndIndex)
-		err := s.db.Update(func(tx *bbolt.Tx) error {
-			key, _ := hex.DecodeString(hashAndIndex)
-			value, err := view.encode()
-			if err != nil {
-				log.Error("Encode utxoview failed:", err)
-				return err
-			}
-			err = tx.Bucket(utxoBucket).Put(key, value)
-			if err != nil {
-				return err
-			}
+func (s *Server) carryAddressCache(entry lru.Item) error {
+	info := entry.(*AddressBalanceInfoCache)
 
-			return nil
-		})
+	err := s.db.Update(func(tx *bbolt.Tx) error {
+		key, _ := hex.DecodeString(info.key)
+		value := info.entry.Encode()
+		err := tx.Bucket(addressBucket).Put(key, value)
 		if err != nil {
 			return err
 		}
+
+		return nil
+	})
+	if err != nil {
+		return err
 	}
-
-	s.utxoSubcache = make(map[string]*UtxoView, utxoSubcacheSize)
-
-	return nil
-}
-
-func (s *Server) carryAddressSubcache(entry lru.Item) error {
-	view := entry.(*AddressBalanceInfoCache)
-	s.addressSubcache[view.key] = view.entry
-
-	// check whether trigger full cache
-	if len(s.addressSubcache) >= addressSubcacheSize {
-		err := s.flushAddressSubcache()
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (s *Server) flushAddressSubcache() error {
-	for scriptHex, info := range s.addressSubcache {
-		err := s.db.Update(func(tx *bbolt.Tx) error {
-			key, _ := hex.DecodeString(scriptHex)
-			return tx.Bucket(addressBucket).Put(key, info.Encode())
-		})
-		if err != nil {
-			return err
-		}
-	}
-
-	s.addressSubcache = make(map[string]*AddressBalanceInfo, addressSubcacheSize)
 
 	return nil
 }
@@ -470,17 +422,7 @@ func (s *Server) flushAddressLRUCache(item lru.Item) error {
 }
 
 func (s *Server) flushCache() error {
-	err := s.flushUtxoSubcache()
-	if err != nil {
-		return err
-	}
-
-	err = s.flushAddressSubcache()
-	if err != nil {
-		return err
-	}
-
-	err = s.utxoCache.Iterate()
+	err := s.utxoCache.Iterate()
 	if err != nil {
 		return err
 	}
@@ -515,58 +457,37 @@ func (s *Server) spend(txHash *chainhash.Hash, view *UtxoView, payment map[strin
 				return err
 			}
 		} else {
-			// search in secondary cache
-			info, ok := s.addressSubcache[cacheKey]
-			if ok {
-				err := s.spendCoin(txHash, view, amountDiff, info)
-				if err != nil {
-					return err
+			// search from backend database
+			var vCopy []byte
+			err := s.db.View(func(tx *bbolt.Tx) error {
+				value := tx.Bucket(addressBucket).Get(script)
+				if value == nil {
+					return errors.New("address entry not found: " + cacheKey)
 				}
 
-				// move to primary cache from secondary cache
-				delete(s.addressSubcache, cacheKey)
+				vCopy = make([]byte, len(value))
+				copy(vCopy, value)
 
-				err = s.addressCache.Add(&AddressBalanceInfoCache{
-					key:   cacheKey,
-					entry: info,
-				})
-				if err != nil {
-					return err
-				}
-			} else {
-				// search from backend database
-				var vCopy []byte
-				err := s.db.View(func(tx *bbolt.Tx) error {
-					value := tx.Bucket(addressBucket).Get(script)
-					if value == nil {
-						return errors.New("address entry not found: " + cacheKey)
-					}
+				return nil
+			})
+			if err != nil {
+				return err
+			}
 
-					vCopy = make([]byte, len(value))
-					copy(vCopy, value)
+			var info AddressBalanceInfo
+			info.Decode(vCopy)
 
-					return nil
-				})
-				if err != nil {
-					return err
-				}
+			err = s.spendCoin(txHash, view, amountDiff, &info)
+			if err != nil {
+				return err
+			}
 
-				var info AddressBalanceInfo
-				info.Decode(vCopy)
-
-				err = s.spendCoin(txHash, view, amountDiff, &info)
-				if err != nil {
-					return err
-				}
-
-				// push back to primary cache
-				err = s.addressCache.Add(&AddressBalanceInfoCache{
-					key:   cacheKey,
-					entry: &info,
-				})
-				if err != nil {
-					return err
-				}
+			err = s.addressCache.Add(&AddressBalanceInfoCache{
+				key:   cacheKey,
+				entry: &info,
+			})
+			if err != nil {
+				return err
 			}
 		}
 	}
@@ -620,76 +541,56 @@ func (s *Server) receive(txHash *chainhash.Hash, view *UtxoView, payment map[str
 				return err
 			}
 		} else {
-			// search in secondary cache
-			info, ok := s.addressSubcache[cacheKey]
-			if ok {
-				err := s.receiveCoin(txHash, view, amountDiff, info)
+
+			// search from backend database
+			var vCopy []byte
+			err := s.db.View(func(tx *bbolt.Tx) error {
+				value := tx.Bucket(addressBucket).Get(script)
+				// receiving coin first time
+				if value != nil {
+					vCopy = make([]byte, len(value))
+					copy(vCopy, value)
+				}
+
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+
+			if vCopy != nil {
+				var info AddressBalanceInfo
+				info.Decode(vCopy)
+
+				err = s.receiveCoin(txHash, view, amountDiff, &info)
 				if err != nil {
 					return err
 				}
 
-				// move to primary cache from secondary cache
-				delete(s.addressSubcache, cacheKey)
-
 				err = s.addressCache.Add(&AddressBalanceInfoCache{
 					key:   cacheKey,
-					entry: info,
+					entry: &info,
 				})
 				if err != nil {
 					return err
 				}
 			} else {
-				// search from backend database
-				var vCopy []byte
-				err := s.db.View(func(tx *bbolt.Tx) error {
-					value := tx.Bucket(addressBucket).Get(script)
-					// receiving coin first time
-					if value != nil {
-						vCopy = make([]byte, len(value))
-						copy(vCopy, value)
-					}
-
-					return nil
+				// Now turn out the address is a new one
+				s.mtx.Lock()
+				err = s.addressCache.Add(&AddressBalanceInfoCache{
+					key: cacheKey,
+					entry: &AddressBalanceInfo{
+						received:    view.amount,
+						txes:        1,
+						unspentTxes: 1,
+						created:     uint32(s.headers[view.height].Time),
+						updated:     uint32(s.headers[view.height].Time),
+						bestTxHash:  txHash.String(),
+					},
 				})
+				s.mtx.Unlock()
 				if err != nil {
 					return err
-				}
-
-				if vCopy != nil {
-					var info AddressBalanceInfo
-					info.Decode(vCopy)
-
-					err = s.receiveCoin(txHash, view, amountDiff, &info)
-					if err != nil {
-						return err
-					}
-
-					// push back to primary cache
-					err = s.addressCache.Add(&AddressBalanceInfoCache{
-						key:   cacheKey,
-						entry: &info,
-					})
-					if err != nil {
-						return err
-					}
-				} else {
-					// Now turn out the address is a new one
-					s.mtx.Lock()
-					err = s.addressCache.Add(&AddressBalanceInfoCache{
-						key: cacheKey,
-						entry: &AddressBalanceInfo{
-							received:    view.amount,
-							txes:        1,
-							unspentTxes: 1,
-							created:     uint32(s.headers[view.height].Time),
-							updated:     uint32(s.headers[view.height].Time),
-							bestTxHash:  txHash.String(),
-						},
-					})
-					s.mtx.Unlock()
-					if err != nil {
-						return err
-					}
 				}
 			}
 		}
@@ -856,17 +757,13 @@ func NewServer() (*Server, error) {
 
 	utxoCacheSize = viper.GetInt("server.cache.utxo")
 	addressCacheSize = viper.GetInt("server.cache.address")
-	utxoSubcacheSize = viper.GetInt("server.cache.utxo-sub")
-	addressSubcacheSize = viper.GetInt("server.cache.address-sub")
 
 	s := &Server{
-		db:              db,
-		rpcBackend:      bc,
-		blockContainer:  make(chan *Block, blockCacheSize),
-		utxoCache:       lru.New(utxoCacheSize, true),
-		addressCache:    lru.New(addressCacheSize, false),
-		utxoSubcache:    make(map[string]*UtxoView, utxoSubcacheSize),
-		addressSubcache: make(map[string]*AddressBalanceInfo, addressSubcacheSize),
+		db:             db,
+		rpcBackend:     bc,
+		blockContainer: make(chan *Block, blockCacheSize),
+		utxoCache:      lru.New(utxoCacheSize, true),
+		addressCache:   lru.New(addressCacheSize, false),
 
 		startBlock: viper.GetInt("server.task.start"),
 		endBlock:   viper.GetInt("server.task.end"),
@@ -875,8 +772,8 @@ func NewServer() (*Server, error) {
 		interrupt: make(chan os.Signal, 1),
 	}
 	s.closed.Store(false)
-	s.utxoCache.Callback = s.carryUtxoSubcache
-	s.addressCache.Callback = s.carryAddressSubcache
+	s.utxoCache.Callback = s.carryUtxoCache
+	s.addressCache.Callback = s.carryAddressCache
 
 	s.utxoCache.ForEach = s.flushUtxoLRUCache
 	s.addressCache.ForEach = s.flushAddressLRUCache
