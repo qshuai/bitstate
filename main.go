@@ -19,8 +19,10 @@ import (
 	"github.com/btcsuite/btclog"
 	"github.com/qshuai/lru"
 	"github.com/spf13/viper"
+	"github.com/syndtr/goleveldb/leveldb"
+	"github.com/syndtr/goleveldb/leveldb/filter"
+	"github.com/syndtr/goleveldb/leveldb/opt"
 	"github.com/toorop/go-bitcoind"
-	"go.etcd.io/bbolt"
 )
 
 const (
@@ -32,9 +34,6 @@ const (
 var (
 	log btclog.Logger
 
-	addressBucket = []byte("address")
-	utxoBucket    = []byte("utxo")
-
 	// cache size default value
 	utxoCacheSize    = 1200000
 	addressCacheSize = 50000
@@ -42,11 +41,22 @@ var (
 	utxoSubcacheSize    = 10000
 	addressSubcacheSize = 200
 
-	utxoRead  float64 = 0
-	utxoWrite float64 = 0
-	utxoDel   float64 = 0
+	utxoReadCount  int     = 0
+	utxoRead       float64 = 0
+	utxoWriteCount         = 0
+	utxoWrite      float64 = 0
+	utxoDelCount           = 0
+	utxoDel        float64 = 0
+
+	addressReadCount  int     = 0
+	addressRead       float64 = 0
+	addressWriteCount int     = 0
+	addressWrite      float64 = 0
 
 	dummyScript = []byte{0, 0, 0, 0}
+
+	readOpt = &opt.ReadOptions{DontFillCache: true}
+	wBatch  = leveldb.Batch{}
 )
 
 type Block struct {
@@ -55,7 +65,7 @@ type Block struct {
 }
 
 type Server struct {
-	db             *bbolt.DB
+	db             *leveldb.DB
 	rpcBackend     *bitcoind.Bitcoind
 	blockContainer chan *Block
 
@@ -143,13 +153,33 @@ func (s *Server) SyncBlocks() {
 }
 
 func (s *Server) start() {
+	for i := 0; i < s.startBlock; i++ {
+		blockHash, err := s.rpcBackend.GetBlockHash(uint64(i))
+		if err != nil {
+			log.Error("get block hash failed: %s", err)
+			return
+		}
+
+		blockHeader, err := s.rpcBackend.GetBlockheader(blockHash)
+		if err != nil {
+			log.Error("get block header failed: %s", err)
+			return
+		}
+
+		s.headers[uint32(i)] = blockHeader
+	}
+
 	// the goroutine be responsible for get block and put to cache
 	go s.SyncBlocks()
 
 	var inputs, outputs int
 	for block := range s.blockContainer {
 		inputs, outputs = 0, 0
+
+		utxoReadCount, utxoWriteCount, utxoDelCount = 0, 0, 0
 		utxoRead, utxoWrite, utxoDel = 0, 0, 0
+		addressReadCount, addressWriteCount = 0, 0
+		addressRead, addressWrite = 0, 0
 
 		select {
 		case <-s.interrupt:
@@ -223,8 +253,9 @@ func (s *Server) start() {
 			}
 		}
 
-		log.Infof("Handle block %s:%d, inputs: %d, outputs: %d, utxo read: %f, utxo write: %f, utxo delete: %f",
-			block.block.BlockHash().String(), block.height, inputs, outputs, utxoRead, utxoWrite, utxoDel)
+		log.Infof("Handle block %s:%d, inputs: %d, outputs: %d, utxo read: %f(%d), utxo write: %f(%d), utxo delete: %f(%d), "+
+			"address read: %f(%d) address write: %f(%d)", block.block.BlockHash().String(), block.height, inputs, outputs, utxoRead,
+			utxoReadCount, utxoWrite, utxoWriteCount, utxoDel, utxoDelCount, addressRead, addressReadCount, addressWrite, addressWriteCount)
 	}
 
 exit:
@@ -314,37 +345,28 @@ func (s *Server) fetchUtxo(input *wire.TxIn) (*UtxoView, error) {
 
 			return entry, nil
 		} else {
-			var vCopy []byte
+			utxoReadCount++
 			start := time.Now()
-			err := s.db.View(func(tx *bbolt.Tx) error {
-				value := tx.Bucket(utxoBucket).Get(utxoDBKey)
-				if value == nil {
-					return errors.New(fmt.Sprintf("utxo entry not found in database: %s:%d(%s)",
-						outpoint.Hash.String(), outpoint.Index, hex.EncodeToString(utxoDBKey)))
-				}
-
-				// copy the db entry value in this transaction
-				vCopy = make([]byte, len(value))
-				copy(vCopy, value)
-
-				return nil
-			})
+			value, err := s.db.Get(utxoDBKey, readOpt)
 			if err != nil {
 				return nil, err
 			}
+			if value == nil {
+				return nil, errors.New(fmt.Sprintf("utxo entry not found in database: %s:%d(%s)",
+					outpoint.Hash.String(), outpoint.Index, hex.EncodeToString(utxoDBKey)))
+			}
+
 			utxoRead += time.Now().Sub(start).Seconds()
 
 			// return the utxo result to caller
 			var entry UtxoView
-			err = entry.decode(vCopy)
+			err = entry.decode(value)
 			if err != nil {
 				return nil, err
 			}
 
 			delStart := time.Now()
-			err = s.db.Update(func(tx *bbolt.Tx) error {
-				return tx.Bucket(utxoBucket).Delete(utxoDBKey)
-			})
+			err = s.db.Delete(utxoDBKey, nil)
 			if err != nil {
 				return nil, err
 			}
@@ -390,25 +412,21 @@ func (s *Server) carryUtxoSubcache(entry lru.Item) error {
 func (s *Server) flushUtxoSubcache() error {
 	for hashAndIndex, view := range s.utxoSubcache {
 		log.Debugf("Save utxo entry to db: %s", hashAndIndex)
-		err := s.db.Update(func(tx *bbolt.Tx) error {
-			key, _ := hex.DecodeString(hashAndIndex)
-			value, err := view.encode()
-			if err != nil {
-				log.Error("Encode utxoview failed:", err)
-				return err
-			}
-			err = tx.Bucket(utxoBucket).Put(key, value)
-			if err != nil {
-				return err
-			}
-
-			return nil
-		})
+		key, _ := hex.DecodeString(hashAndIndex)
+		value, err := view.encode()
 		if err != nil {
 			return err
 		}
+		utxoWriteCount++
+		wBatch.Put(key, value)
 	}
 
+	start := time.Now()
+	if err := s.db.Write(&wBatch, nil); err != nil {
+		return err
+	}
+	utxoWrite += time.Now().Sub(start).Seconds()
+	wBatch.Reset()
 	s.utxoSubcache = make(map[string]*UtxoView, utxoSubcacheSize)
 
 	return nil
@@ -431,15 +449,17 @@ func (s *Server) carryAddressSubcache(entry lru.Item) error {
 
 func (s *Server) flushAddressSubcache() error {
 	for scriptHex, info := range s.addressSubcache {
-		err := s.db.Update(func(tx *bbolt.Tx) error {
-			key, _ := hex.DecodeString(scriptHex)
-			return tx.Bucket(addressBucket).Put(key, info.Encode())
-		})
-		if err != nil {
-			return err
-		}
+		key, _ := hex.DecodeString(scriptHex)
+		addressWriteCount++
+		wBatch.Put(key, info.Encode())
 	}
 
+	start := time.Now()
+	if err := s.db.Write(&wBatch, nil); err != nil {
+		return err
+	}
+	addressWrite += time.Now().Sub(start).Seconds()
+	wBatch.Reset()
 	s.addressSubcache = make(map[string]*AddressBalanceInfo, addressSubcacheSize)
 
 	return nil
@@ -447,26 +467,22 @@ func (s *Server) flushAddressSubcache() error {
 
 func (s *Server) flushUtxoLRUCache(item lru.Item) error {
 	view := item.(*UtxoViewCache)
-	err := s.db.Update(func(tx *bbolt.Tx) error {
-		key, _ := hex.DecodeString(view.key)
-		v, err := view.entry.encode()
-		if err != nil {
-			return err
-		}
-		return tx.Bucket(utxoBucket).Put(key, v)
-	})
+	key, _ := hex.DecodeString(view.key)
+	v, err := view.entry.encode()
+	if err != nil {
+		return err
+	}
+	wBatch.Put(key, v)
 
-	return err
+	return nil
 }
 
 func (s *Server) flushAddressLRUCache(item lru.Item) error {
 	info := item.(*AddressBalanceInfoCache)
-	err := s.db.Update(func(tx *bbolt.Tx) error {
-		key, _ := hex.DecodeString(info.key)
-		return tx.Bucket(addressBucket).Put(key, info.entry.Encode())
-	})
+	key, _ := hex.DecodeString(info.key)
+	wBatch.Put(key, info.entry.Encode())
 
-	return err
+	return nil
 }
 
 func (s *Server) flushCache() error {
@@ -484,8 +500,16 @@ func (s *Server) flushCache() error {
 	if err != nil {
 		return err
 	}
+	if err := s.db.Write(&wBatch, nil); err != nil {
+		return err
+	}
 
-	return s.addressCache.Iterate()
+	err = s.addressCache.Iterate()
+	if err != nil {
+		return err
+	}
+
+	return s.db.Write(&wBatch, nil)
 }
 
 func (s *Server) spend(txHash *chainhash.Hash, view *UtxoView, payment map[string]int64) error {
@@ -534,25 +558,19 @@ func (s *Server) spend(txHash *chainhash.Hash, view *UtxoView, payment map[strin
 					return err
 				}
 			} else {
-				// search from backend database
-				var vCopy []byte
-				err := s.db.View(func(tx *bbolt.Tx) error {
-					value := tx.Bucket(addressBucket).Get(script)
-					if value == nil {
-						return errors.New("address entry not found: " + cacheKey)
-					}
-
-					vCopy = make([]byte, len(value))
-					copy(vCopy, value)
-
-					return nil
-				})
+				addressReadCount++
+				start := time.Now()
+				value, err := s.db.Get(script, readOpt)
+				addressRead += time.Now().Sub(start).Seconds()
 				if err != nil {
 					return err
 				}
+				if value == nil {
+					return errors.New("address entry not found: " + cacheKey)
+				}
 
 				var info AddressBalanceInfo
-				info.Decode(vCopy)
+				info.Decode(value)
 
 				err = s.spendCoin(txHash, view, amountDiff, &info)
 				if err != nil {
@@ -639,25 +657,23 @@ func (s *Server) receive(txHash *chainhash.Hash, view *UtxoView, payment map[str
 					return err
 				}
 			} else {
+				var notFound bool
 				// search from backend database
-				var vCopy []byte
-				err := s.db.View(func(tx *bbolt.Tx) error {
-					value := tx.Bucket(addressBucket).Get(script)
-					// receiving coin first time
-					if value != nil {
-						vCopy = make([]byte, len(value))
-						copy(vCopy, value)
-					}
-
-					return nil
-				})
+				addressReadCount++
+				start := time.Now()
+				value, err := s.db.Get(script, readOpt)
+				addressRead += time.Now().Sub(start).Seconds()
 				if err != nil {
-					return err
+					if err == leveldb.ErrNotFound {
+						notFound = true
+					} else {
+						return err
+					}
 				}
 
-				if vCopy != nil {
+				if !notFound {
 					var info AddressBalanceInfo
-					info.Decode(vCopy)
+					info.Decode(value)
 
 					err = s.receiveCoin(txHash, view, amountDiff, &info)
 					if err != nil {
@@ -740,27 +756,6 @@ func getSafeScript(script []byte) []byte {
 	return script
 }
 
-func mkDirAndFile(filePath string) error {
-	dir := filepath.Dir(filePath)
-	_, err := os.Stat(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			err = os.Mkdir(dir, os.ModePerm)
-			if err != nil {
-				return err
-			}
-			_, err = os.Create(filePath)
-			if err != nil {
-				return err
-			}
-		} else {
-			return err
-		}
-	}
-
-	return nil
-}
-
 func main() {
 	// read config file
 	viper.SetConfigFile("config.yml")
@@ -815,33 +810,12 @@ func main() {
 
 func NewServer() (*Server, error) {
 	dbFile := viper.GetString("server.db.dbpath")
-	err := mkDirAndFile(dbFile)
-	if err != nil {
-		log.Error("Make db directory or touch db file failed:", err)
-		return nil, err
-	}
-	db, err := bbolt.Open(viper.GetString("server.db.dbpath"), 0600,
-		&bbolt.Options{
-			Timeout:      0,
-			NoGrowSync:   false,
-			FreelistType: bbolt.FreelistArrayType,
-		})
-	if err != nil {
-		return nil, err
-	}
-
-	// initialize necessary bucket
-	err = db.Update(func(tx *bbolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists(utxoBucket)
-		if err != nil {
-			return err
-		}
-
-		_, err = tx.CreateBucketIfNotExists(addressBucket)
-		return err
+	db, err := leveldb.OpenFile(dbFile, &opt.Options{
+		Filter:      filter.NewBloomFilter(10),
+		Compression: opt.SnappyCompression,
 	})
 	if err != nil {
-		log.Errorf("Create necessary db bucket failed: %s", err)
+		return nil, err
 	}
 
 	bc, err := bitcoind.New(
