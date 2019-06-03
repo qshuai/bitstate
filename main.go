@@ -29,6 +29,8 @@ const (
 	logFile = "bitstate.log"
 
 	blockCacheSize = 5
+
+	flushSize = 20000
 )
 
 var (
@@ -473,6 +475,14 @@ func (s *Server) flushUtxoLRUCache(item lru.Item) error {
 		return err
 	}
 	wBatch.Put(key, v)
+	if wBatch.Len() > flushSize {
+		err = s.db.Write(&wBatch, nil)
+		if err != nil {
+			return err
+		}
+
+		wBatch = leveldb.Batch{}
+	}
 
 	return nil
 }
@@ -481,7 +491,14 @@ func (s *Server) flushAddressLRUCache(item lru.Item) error {
 	info := item.(*AddressBalanceInfoCache)
 	key, _ := hex.DecodeString(info.key)
 	wBatch.Put(key, info.entry.Encode())
+	if wBatch.Len() > flushSize {
+		err := s.db.Write(&wBatch, nil)
+		if err != nil {
+			return err
+		}
 
+		wBatch = leveldb.Batch{}
+	}
 	return nil
 }
 
