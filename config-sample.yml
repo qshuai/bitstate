@@ -16,3 +16,8 @@ server:
   task:
     start: 0
     end: 300000
+  cache:
+    utxo: 1000000
+    address: 2000000
+    utxo-sub: 200000
+    address-sub: 300000

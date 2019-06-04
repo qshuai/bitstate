@@ -37,11 +37,11 @@ var (
 	log btclog.Logger
 
 	// cache size default value
-	utxoCacheSize    = 1200000
-	addressCacheSize = 50000
+	utxoCacheSize    = 200000
+	addressCacheSize = 300000
 	// subcache size default value
 	utxoSubcacheSize    = 10000
-	addressSubcacheSize = 200
+	addressSubcacheSize = 20000
 
 	utxoReadCount  int     = 0
 	utxoRead       float64 = 0
