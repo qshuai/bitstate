@@ -370,6 +370,7 @@ func (s *Server) fetchUtxo(input *wire.TxIn) (*UtxoView, error) {
 				return nil, err
 			}
 
+			utxoDelCount++
 			delStart := time.Now()
 			err = s.db.Delete(utxoDBKey, nil)
 			if err != nil {
