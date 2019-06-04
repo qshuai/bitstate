@@ -455,6 +455,8 @@ func (s *Server) carryAddressSubcache(entry lru.Item) error {
 
 func (s *Server) flushAddressSubcache() error {
 	for scriptHex, info := range s.addressSubcache {
+		log.Debugf("store address entry to db from secondary cache: %s", scriptHex)
+
 		key, _ := hex.DecodeString(scriptHex)
 		addressWriteCount++
 		wBatch.Put(key, info.Encode())
@@ -561,9 +563,12 @@ func (s *Server) spend(txHash *chainhash.Hash, view *UtxoView, payment map[strin
 			}
 
 			// optimize cache
-			_, err = s.ReduceCache(cacheKey, info)
+			striped, err := s.ReduceCache(cacheKey, info)
 			if err != nil {
 				return err
+			}
+			if striped {
+				log.Debugf("move address entry from primary cache to seconday cache: %s", cacheKey)
 			}
 		} else {
 			// search in secondary cache
@@ -591,11 +596,12 @@ func (s *Server) spend(txHash *chainhash.Hash, view *UtxoView, payment map[strin
 					if err != nil {
 						return err
 					}
+					log.Debugf("move address entry from secondary cache to primary cache: %s", cacheKey)
 				}
 			} else {
 				addressReadCount++
 				start := time.Now()
-				value, err := s.db.Get(script, readOpt)
+				value, err := s.db.Get(addressDBKey(script), readOpt)
 				addressRead += time.Now().Sub(start).Seconds()
 				if err != nil {
 					if err == leveldb.ErrNotFound {
@@ -619,8 +625,9 @@ func (s *Server) spend(txHash *chainhash.Hash, view *UtxoView, payment map[strin
 				}
 
 				if striped {
-					// push back to secondary cache
+					// push to secondary cache
 					s.addressSubcache[cacheKey] = &info
+					log.Debugf("add address entry to secondary cache: %s", cacheKey)
 				} else {
 					// push back to primary cache
 					err = s.addressCache.Add(&AddressBalanceInfoCache{
@@ -630,6 +637,7 @@ func (s *Server) spend(txHash *chainhash.Hash, view *UtxoView, payment map[strin
 					if err != nil {
 						return err
 					}
+					log.Debugf("add address entry to primary cache: %s", cacheKey)
 				}
 			}
 		}
@@ -702,12 +710,13 @@ func (s *Server) receive(txHash *chainhash.Hash, view *UtxoView, payment map[str
 				if err != nil {
 					return err
 				}
+				log.Debugf("convert address cache entry to primary cache: %s", cacheKey)
 			} else {
 				var notFound bool
 				// search from backend database
 				addressReadCount++
 				start := time.Now()
-				value, err := s.db.Get(script, readOpt)
+				value, err := s.db.Get(addressDBKey(script), readOpt)
 				addressRead += time.Now().Sub(start).Seconds()
 				if err != nil {
 					if err == leveldb.ErrNotFound {
@@ -734,6 +743,7 @@ func (s *Server) receive(txHash *chainhash.Hash, view *UtxoView, payment map[str
 					if err != nil {
 						return err
 					}
+					log.Debugf("add address entry to primary cache from db: %s", cacheKey)
 				} else {
 					// Now turn out the address is a new one
 					s.mtx.Lock()
@@ -752,6 +762,8 @@ func (s *Server) receive(txHash *chainhash.Hash, view *UtxoView, payment map[str
 					if err != nil {
 						return err
 					}
+
+					log.Debugf("add a new address entry to primary cache: %s", cacheKey)
 				}
 			}
 		}
@@ -783,6 +795,7 @@ func (s *Server) ReduceCache(cacheKey string, info *AddressBalanceInfo) (bool, e
 	if info.GetBalance() == 0 {
 		s.addressCache.Remove(cacheKey)
 		s.addressSubcache[cacheKey] = info
+		log.Debugf("move address entry to secondary cache from primary cache: %s", cacheKey)
 
 		// check whether trigger full cache
 		if len(s.addressSubcache) >= addressSubcacheSize {
@@ -811,11 +824,15 @@ func generateUtxoKey(txHash *chainhash.Hash, idx uint32) []byte {
 }
 
 func generateAddressKey(script []byte) string {
+	return hex.EncodeToString(addressDBKey(script))
+}
+
+func addressDBKey(script []byte) []byte {
 	buf := bytes.NewBuffer(make([]byte, 0, 1+len(getSafeScript(script))))
 	buf.Write(addressKeyPrefix)
 	buf.Write(getSafeScript(script))
 
-	return hex.EncodeToString(buf.Bytes())
+	return buf.Bytes()
 }
 
 func getSafeScript(script []byte) []byte {
