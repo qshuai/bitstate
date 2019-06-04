@@ -43,13 +43,13 @@ var (
 	utxoSubcacheSize    = 10000
 	addressSubcacheSize = 20000
 
-	utxoReadCount  int     = 0
-	utxoRead       float64 = 0
-	utxoWriteCount         = 0
-	utxoWrite      float64 = 0
-	utxoDelCount           = 0
-	utxoDel        float64 = 0
-
+	// debug
+	utxoReadCount     int     = 0
+	utxoRead          float64 = 0
+	utxoWriteCount            = 0
+	utxoWrite         float64 = 0
+	utxoDelCount              = 0
+	utxoDel           float64 = 0
 	addressReadCount  int     = 0
 	addressRead       float64 = 0
 	addressWriteCount int     = 0
@@ -59,6 +59,9 @@ var (
 
 	readOpt = &opt.ReadOptions{DontFillCache: true}
 	wBatch  = leveldb.Batch{}
+
+	utxoKeyPrefix    = []byte{0}
+	addressKeyPrefix = []byte{1}
 )
 
 type Block struct {
@@ -797,7 +800,8 @@ func generateUtxoKey(txHash *chainhash.Hash, idx uint32) []byte {
 	shash := shortHash(txHash)
 	index := CompressedUint32(idx)
 
-	buf := bytes.NewBuffer(make([]byte, 0, len(shash)+len(index)))
+	buf := bytes.NewBuffer(make([]byte, 0, 1+len(shash)+len(index)))
+	buf.Write(utxoKeyPrefix)
 	buf.Write(shash)
 	buf.Write(index)
 
@@ -805,7 +809,11 @@ func generateUtxoKey(txHash *chainhash.Hash, idx uint32) []byte {
 }
 
 func generateAddressKey(script []byte) string {
-	return hex.EncodeToString(getSafeScript(script))
+	buf := bytes.NewBuffer(make([]byte, 0, 1+len(getSafeScript(script))))
+	buf.Write(addressKeyPrefix)
+	buf.Write(getSafeScript(script))
+
+	return hex.EncodeToString(buf.Bytes())
 }
 
 func getSafeScript(script []byte) []byte {
