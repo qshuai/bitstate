@@ -897,8 +897,8 @@ func NewServer() (*Server, error) {
 		db:              db,
 		rpcBackend:      bc,
 		blockContainer:  make(chan *Block, blockCacheSize),
-		utxoCache:       lru.New(utxoCacheSize, true),
-		addressCache:    lru.New(addressCacheSize, false),
+		utxoCache:       lru.New(utxoCacheSize, false),
+		addressCache:    lru.New(addressCacheSize, true),
 		utxoSubcache:    make(map[string]*UtxoView, utxoSubcacheSize),
 		addressSubcache: make(map[string]*AddressBalanceInfo, addressSubcacheSize),
 
