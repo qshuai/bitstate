@@ -2,8 +2,6 @@ package main
 
 import (
 	"encoding/binary"
-
-	"github.com/btcsuite/btcd/wire"
 )
 
 type AddressBalanceInfo struct {
@@ -38,30 +36,6 @@ func (info *AddressBalanceInfo) Decode(value []byte) {
 	info.updated = binary.LittleEndian.Uint32(value[28:32])
 }
 
-func (info *AddressBalanceInfo) receiveCoin(txHash string, blockTime uint32,
-	out *wire.TxOut, isFirst bool) {
-
-	if info.bestTxHash != txHash {
-		info.txes++
-		info.bestTxHash = txHash
-	}
-
-	if isFirst {
-		info.created = blockTime
-	}
-
-	info.received += out.Value
-	info.unspentTxes++
-	info.updated = blockTime
-}
-
-func (info *AddressBalanceInfo) spendCoin(txHash string, blockTime uint32, value int64) {
-	if info.bestTxHash != txHash {
-		info.txes++
-		info.bestTxHash = txHash
-	}
-
-	info.updated = blockTime
-	info.send += value
-	info.unspentTxes--
+func (info *AddressBalanceInfo) GetBalance() int64 {
+	return info.received - info.send
 }

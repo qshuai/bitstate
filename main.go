@@ -555,6 +555,12 @@ func (s *Server) spend(txHash *chainhash.Hash, view *UtxoView, payment map[strin
 			if err != nil {
 				return err
 			}
+
+			// optimize cache
+			_, err = s.ReduceCache(cacheKey, info)
+			if err != nil {
+				return err
+			}
 		} else {
 			// search in secondary cache
 			info, ok := s.addressSubcache[cacheKey]
@@ -564,15 +570,23 @@ func (s *Server) spend(txHash *chainhash.Hash, view *UtxoView, payment map[strin
 					return err
 				}
 
-				// move to primary cache from secondary cache
-				delete(s.addressSubcache, cacheKey)
-
-				err = s.addressCache.Add(&AddressBalanceInfoCache{
-					key:   cacheKey,
-					entry: info,
-				})
+				striped, err := s.ReduceCache(cacheKey, info)
 				if err != nil {
 					return err
+				}
+
+				// valuable entry
+				if !striped {
+					// move to primary cache from secondary cache
+					delete(s.addressSubcache, cacheKey)
+
+					err = s.addressCache.Add(&AddressBalanceInfoCache{
+						key:   cacheKey,
+						entry: info,
+					})
+					if err != nil {
+						return err
+					}
 				}
 			} else {
 				addressReadCount++
@@ -594,13 +608,23 @@ func (s *Server) spend(txHash *chainhash.Hash, view *UtxoView, payment map[strin
 					return err
 				}
 
-				// push back to primary cache
-				err = s.addressCache.Add(&AddressBalanceInfoCache{
-					key:   cacheKey,
-					entry: &info,
-				})
+				striped, err := s.ReduceCache(cacheKey, &info)
 				if err != nil {
 					return err
+				}
+
+				if striped {
+					// push back to secondary cache
+					s.addressSubcache[cacheKey] = &info
+				} else {
+					// push back to primary cache
+					err = s.addressCache.Add(&AddressBalanceInfoCache{
+						key:   cacheKey,
+						entry: &info,
+					})
+					if err != nil {
+						return err
+					}
 				}
 			}
 		}
@@ -748,6 +772,25 @@ func (s *Server) receiveCoin(txHash *chainhash.Hash, view *UtxoView, amountDiff 
 	info.unspentTxes++
 
 	return nil
+}
+
+func (s *Server) ReduceCache(cacheKey string, info *AddressBalanceInfo) (bool, error) {
+	if info.GetBalance() == 0 {
+		s.addressCache.Remove(cacheKey)
+		s.addressSubcache[cacheKey] = info
+
+		// check whether trigger full cache
+		if len(s.addressSubcache) >= addressSubcacheSize {
+			err := s.flushAddressSubcache()
+			if err != nil {
+				return true, err
+			}
+		}
+
+		return true, nil
+	}
+
+	return false, nil
 }
 
 func generateUtxoKey(txHash *chainhash.Hash, idx uint32) []byte {
