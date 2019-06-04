@@ -598,10 +598,11 @@ func (s *Server) spend(txHash *chainhash.Hash, view *UtxoView, payment map[strin
 				value, err := s.db.Get(script, readOpt)
 				addressRead += time.Now().Sub(start).Seconds()
 				if err != nil {
+					if err == leveldb.ErrNotFound {
+						return errors.New("address entry not found in leveldb: " + hex.EncodeToString(script))
+					}
+
 					return err
-				}
-				if value == nil {
-					return errors.New("address entry not found: " + cacheKey)
 				}
 
 				var info AddressBalanceInfo
