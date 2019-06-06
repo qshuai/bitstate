@@ -33,7 +33,7 @@ func generateCanonicalScript(pkScript []byte) ([][]byte, error) {
 	ret, err := parseScript(pkScript)
 	if err != nil {
 		// ignore nostandard script
-		log.Warnf("parse script failed for script: %s, reasmon: %s",
+		log.Warnf("parse script failed for script: %s, reason: %s",
 			hex.EncodeToString(pkScript), err.Error())
 		return [][]byte{pkScript}, nil
 	}
