@@ -16,10 +16,10 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/qshuai/bitstate/database"
-	bboltdb "github.com/qshuai/bitstate/database/bboltdb"
+	"github.com/qshuai/bitstate/database/bboltdb"
+	"github.com/qshuai/go-bitcoind"
 	"github.com/qshuai/lru"
 	"github.com/spf13/viper"
-	"github.com/toorop/go-bitcoind"
 	"go.etcd.io/bbolt"
 )
 
@@ -360,7 +360,7 @@ func (s *Server) flushUtxoLRUCache(item lru.Item) error {
 	if err != nil {
 		return err
 	}
-	err = s.db.Put(utxoBucket, key ,value)
+	err = s.db.Put(utxoBucket, key, value)
 
 	return err
 }
@@ -412,9 +412,9 @@ func (s *Server) spend(txHash *chainhash.Hash, view *UtxoView, payment map[strin
 			// search from backend database
 			addressReadCount++
 			start := time.Now()
-			value, err := s.db.Get(addressBucket,script)
+			value, err := s.db.Get(addressBucket, script)
 			if err != nil {
-				if err == database.NotFoundError{
+				if err == database.NotFoundError {
 					return errors.New("address entry not found: " + cacheKey)
 				}
 
