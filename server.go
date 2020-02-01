@@ -5,24 +5,26 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/btcsuite/btcd/blockchain"
-	"github.com/btcsuite/btcd/chaincfg/chainhash"
-	"github.com/btcsuite/btcd/wire"
-	"github.com/qshuai/lru"
-	"github.com/spf13/viper"
-	"github.com/toorop/go-bitcoind"
-	"go.etcd.io/bbolt"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/btcsuite/btcd/blockchain"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/wire"
+	"github.com/qshuai/bitstate/database"
+	bboltdb "github.com/qshuai/bitstate/database/bboltdb"
+	"github.com/qshuai/lru"
+	"github.com/spf13/viper"
+	"github.com/toorop/go-bitcoind"
+	"go.etcd.io/bbolt"
 )
 
 type Server struct {
-	db             *bbolt.DB
+	db             database.DB
 	rpcBackend     *bitcoind.Bitcoind
 	blockContainer chan *Block
 
@@ -91,11 +93,6 @@ func (s *Server) SyncBlocks() {
 			return
 		}
 
-		if err != nil {
-			log.Errorf("get block failed: %s\n", err)
-			return
-		}
-
 		s.blockContainer <- &Block{
 			block:  &block,
 			height: uint32(i),
@@ -144,6 +141,8 @@ func (s *Server) start() {
 				return
 			}
 			txHash := tx.TxHash()
+
+			// handle spend coin
 			for idx := 0; idx < len(tx.TxIn); idx++ {
 				// coinbase transaction input does not spent any utxo and impact any address balance.
 				// so skip the coinbase transaction input.
@@ -170,18 +169,17 @@ func (s *Server) start() {
 					spent:          false,
 					pkScript:       output.PkScript,
 				}
+				key := hex.EncodeToString(generateUtxoKey(&txHash, uint32(idx)))
 				err := s.utxoCache.Add(&UtxoViewCache{
-					key:   hex.EncodeToString(generateUtxoKey(&txHash, uint32(idx))),
+					key:   key,
 					entry: view,
 				})
 				if err != nil {
-					log.Error("Add utxo entry to cache failed:", err)
+					log.Error("Add utxo entry to cache failed: ", err)
 					return
 				}
 
-				log.Debugf("Save utxo entry to cache: %s",
-					hex.EncodeToString(generateUtxoKey(&txHash, uint32(idx))))
-
+				log.Debugf("Save utxo entry to cache: %s", key)
 				err = s.receive(&txHash, view, payment)
 				if err != nil {
 					log.Errorf("receiving coin failed, output: %s:%d, reason: %s", txHash.String(), idx, err)
@@ -274,39 +272,30 @@ func (s *Server) fetchUtxo(input *wire.TxIn) (*UtxoView, error) {
 
 		return view.entry, nil
 	} else {
-		var vCopy []byte
 		start := time.Now()
 		utxoReadCount++
-		err := s.db.View(func(tx *bbolt.Tx) error {
-			value := tx.Bucket(utxoBucket).Get(utxoDBKey)
-			if value == nil {
-				return errors.New(fmt.Sprintf("utxo entry not found in database: %s:%d(%s)",
+		value, err := s.db.Get(utxoBucket, utxoDBKey)
+		if err != nil {
+			if err == database.NotFoundError {
+				return nil, errors.New(fmt.Sprintf("utxo entry not found in database: %s:%d(%s)",
 					outpoint.Hash.String(), outpoint.Index, hex.EncodeToString(utxoDBKey)))
 			}
 
-			// copy the db entry value in this transaction
-			vCopy = make([]byte, len(value))
-			copy(vCopy, value)
-
-			return nil
-		})
-		if err != nil {
 			return nil, err
 		}
+
 		utxoRead += time.Now().Sub(start).Seconds()
 
 		// return the utxo result to caller
 		var entry UtxoView
-		err = entry.decode(vCopy)
+		err = entry.decode(value)
 		if err != nil {
 			return nil, err
 		}
 
 		delStart := time.Now()
 		utxoDelCount++
-		err = s.db.Update(func(tx *bbolt.Tx) error {
-			return tx.Bucket(utxoBucket).Delete(utxoDBKey)
-		})
+		err = s.db.Remove(utxoBucket, utxoDBKey)
 		if err != nil {
 			return nil, err
 		}
@@ -324,31 +313,23 @@ func (s *Server) shutdown() {
 	}
 	log.Info("Flush cache completed!")
 
-	err = s.db.Close()
+	err = s.db.Shutdown()
 	if err != nil {
-		log.Errorf("close bbolt database failed: %s", err)
+		log.Errorf("close bboltdb database failed: %s", err)
 	}
 }
 
 func (s *Server) carryUtxoCache(entry lru.Item) error {
 	view := entry.(*UtxoViewCache)
-
+	key, _ := hex.DecodeString(view.key)
+	value, err := view.entry.encode()
+	if err != nil {
+		log.Error("Encode utxoview failed:", err)
+		return err
+	}
 	utxoWriteCount++
 	start := time.Now()
-	err := s.db.Update(func(tx *bbolt.Tx) error {
-		key, _ := hex.DecodeString(view.key)
-		value, err := view.entry.encode()
-		if err != nil {
-			log.Error("Encode utxoview failed:", err)
-			return err
-		}
-		err = tx.Bucket(utxoBucket).Put(key, value)
-		if err != nil {
-			return err
-		}
-
-		return nil
-	})
+	err = s.db.Put(utxoBucket, key, value)
 	if err != nil {
 		return err
 	}
@@ -359,19 +340,11 @@ func (s *Server) carryUtxoCache(entry lru.Item) error {
 
 func (s *Server) carryAddressCache(entry lru.Item) error {
 	info := entry.(*AddressBalanceInfoCache)
-
+	key, _ := hex.DecodeString(info.key)
+	value := info.entry.Encode()
 	addressWriteCount++
 	start := time.Now()
-	err := s.db.Update(func(tx *bbolt.Tx) error {
-		key, _ := hex.DecodeString(info.key)
-		value := info.entry.Encode()
-		err := tx.Bucket(addressBucket).Put(key, value)
-		if err != nil {
-			return err
-		}
-
-		return nil
-	})
+	err := s.db.Put(addressBucket, key, value)
 	if err != nil {
 		return err
 	}
@@ -382,26 +355,22 @@ func (s *Server) carryAddressCache(entry lru.Item) error {
 
 func (s *Server) flushUtxoLRUCache(item lru.Item) error {
 	view := item.(*UtxoViewCache)
-	err := s.db.Update(func(tx *bbolt.Tx) error {
-		key, _ := hex.DecodeString(view.key)
-		v, err := view.entry.encode()
-		if err != nil {
-			return err
-		}
-		return tx.Bucket(utxoBucket).Put(key, v)
-	})
+	key, _ := hex.DecodeString(view.key)
+	value, err := view.entry.encode()
+	if err != nil {
+		return err
+	}
+	err = s.db.Put(utxoBucket, key ,value)
 
 	return err
 }
 
 func (s *Server) flushAddressLRUCache(item lru.Item) error {
 	info := item.(*AddressBalanceInfoCache)
-	err := s.db.Update(func(tx *bbolt.Tx) error {
-		key, _ := hex.DecodeString(info.key)
-		return tx.Bucket(addressBucket).Put(key, info.entry.Encode())
-	})
+	key, _ := hex.DecodeString(info.key)
+	value := info.entry.Encode()
 
-	return err
+	return s.db.Put(addressBucket, key, value)
 }
 
 func (s *Server) flushCache() error {
@@ -441,27 +410,20 @@ func (s *Server) spend(txHash *chainhash.Hash, view *UtxoView, payment map[strin
 			}
 		} else {
 			// search from backend database
-			var vCopy []byte
 			addressReadCount++
 			start := time.Now()
-			err := s.db.View(func(tx *bbolt.Tx) error {
-				value := tx.Bucket(addressBucket).Get(script)
-				if value == nil {
+			value, err := s.db.Get(addressBucket,script)
+			if err != nil {
+				if err == database.NotFoundError{
 					return errors.New("address entry not found: " + cacheKey)
 				}
 
-				vCopy = make([]byte, len(value))
-				copy(vCopy, value)
-
-				return nil
-			})
-			if err != nil {
 				return err
 			}
 			addressRead += time.Now().Sub(start).Seconds()
 
 			var info AddressBalanceInfo
-			info.Decode(vCopy)
+			info.Decode(value)
 
 			err = s.spendCoin(txHash, view, amountDiff, &info)
 			if err != nil {
@@ -529,27 +491,21 @@ func (s *Server) receive(txHash *chainhash.Hash, view *UtxoView, payment map[str
 		} else {
 
 			// search from backend database
-			var vCopy []byte
 			addressReadCount++
 			start := time.Now()
-			err := s.db.View(func(tx *bbolt.Tx) error {
-				value := tx.Bucket(addressBucket).Get(script)
-				// receiving coin first time
-				if value != nil {
-					vCopy = make([]byte, len(value))
-					copy(vCopy, value)
-				}
-
-				return nil
-			})
+			value, err := s.db.Get(addressBucket, script)
 			if err != nil {
-				return err
+				if err == database.NotFoundError {
+					value = nil
+				} else {
+					return err
+				}
 			}
 			addressRead += time.Now().Sub(start).Seconds()
 
-			if vCopy != nil {
+			if value != nil {
 				var info AddressBalanceInfo
-				info.Decode(vCopy)
+				info.Decode(value)
 
 				err = s.receiveCoin(txHash, view, amountDiff, &info)
 				if err != nil {
@@ -630,56 +586,38 @@ func getSafeScript(script []byte) []byte {
 	return script
 }
 
-func mkDirAndFile(filePath string) error {
-	dir := filepath.Dir(filePath)
-	_, err := os.Stat(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			err = os.Mkdir(dir, os.ModePerm)
-			if err != nil {
-				return err
-			}
-			_, err = os.Create(filePath)
-			if err != nil {
-				return err
-			}
-		} else {
-			return err
-		}
-	}
-
-	return nil
-}
-
 func NewServer() (*Server, error) {
-	dbFile := viper.GetString("server.db.dbpath")
-	err := mkDirAndFile(dbFile)
-	if err != nil {
-		log.Error("Make db directory or touch db file failed:", err)
-		return nil, err
+	driverName := viper.GetString("server.db.driver")
+	driver, ok := database.GetDriver(driverName)
+	if !ok {
+		return nil, errors.New("database driver not exited")
 	}
-	db, err := bbolt.Open(viper.GetString("server.db.dbpath"), 0600,
-		&bbolt.Options{
+
+	var db database.DB
+	switch driver {
+	case database.BboltDriver:
+		dbFile := viper.GetString("server.db.bbolt.dbpath")
+		bboltDB, err := bboltdb.New(dbFile, &bbolt.Options{
 			Timeout:      0,
 			NoGrowSync:   false,
 			FreelistType: bbolt.FreelistArrayType,
 		})
-	if err != nil {
-		return nil, err
-	}
-
-	// initialize necessary bucket
-	err = db.Update(func(tx *bbolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists(utxoBucket)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
-		_, err = tx.CreateBucketIfNotExists(addressBucket)
-		return err
-	})
-	if err != nil {
-		log.Errorf("Create necessary db bucket failed: %s", err)
+		// initialize necessary bucket
+		err = bboltDB.InitBucket(utxoBucket, addressBucket)
+		if err != nil {
+			log.Errorf("Create necessary db bucket failed: %s", err)
+		}
+
+		db = bboltDB
+
+	case database.LeveldbDriver:
+
+	default:
+
 	}
 
 	bc, err := bitcoind.New(

@@ -2,11 +2,11 @@ package main
 
 import (
 	"encoding/hex"
+	"errors"
 
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcutil"
-	"github.com/pkg/errors"
 )
 
 func shortHash(txHash *chainhash.Hash) []byte {
@@ -19,6 +19,7 @@ func shortHash(txHash *chainhash.Hash) []byte {
 
 func isNullDataOutput(pkscript []byte) bool {
 	if pkscript != nil && len(pkscript) > 0 && pkscript[0] == txscript.OP_RETURN {
+		// todo record lost coin
 		return true
 	}
 

@@ -52,7 +52,7 @@ func main() {
 	viper.AddConfigPath("./")
 	err := viper.ReadInConfig()
 	if err != nil {
-		fmt.Println("Read config file:", err)
+		fmt.Println("Read config file failed: ", err)
 		return
 	}
 
@@ -63,18 +63,18 @@ func main() {
 		if !os.IsExist(err) {
 			err = os.Mkdir(logPath, os.ModePerm)
 			if err != nil {
-				fmt.Println("Make logger directory failed:", err)
-				return
+				fmt.Println("Make logger directory failed: ", err)
+				os.Exit(1)
 			}
 		} else {
-			fmt.Println("Acquire logger path information failed:", err)
-			return
+			fmt.Println("Acquire logger path information failed: ", err)
+			os.Exit(1)
 		}
 	}
 	file, err := os.OpenFile(filepath.Join(logPath, logFile), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0666)
 	if err != nil {
-		fmt.Println("Open logger file failed:", err)
-		return
+		fmt.Println("Open logger file failed: ", err)
+		os.Exit(1)
 	}
 	log = btclog.NewBackend(file).Logger("")
 	levelConf := viper.GetString("server.log.level")
@@ -87,8 +87,8 @@ func main() {
 	// get server instance
 	server, err := NewServer()
 	if err != nil {
-		log.Error("New server instance failed:", err)
-		return
+		log.Error("New server instance failed: ", err)
+		os.Exit(1)
 	}
 
 	server.start()
