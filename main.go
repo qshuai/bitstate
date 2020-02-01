@@ -20,6 +20,7 @@ var (
 
 	addressBucket = []byte("a")
 	utxoBucket    = []byte("u")
+	bestHeightKey = []byte("bestheight")
 
 	// cache size default value
 	utxoCacheSize    = 1200000

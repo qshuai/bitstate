@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -26,6 +27,8 @@ import (
 )
 
 type Server struct {
+	bestHeight int
+
 	db             database.DB
 	rpcBackend     *bitcoind.Bitcoind
 	blockContainer chan *Block
@@ -55,6 +58,14 @@ func (s *Server) SyncBlocks() {
 		log.Debug("Sync block goroutine exit")
 	}()
 
+	// sync blockheader
+	if s.startBlock != 0 {
+		for i := 0; i < s.startBlock; i++ {
+			blockheader := s.getBlockHeader(i)
+			s.headers[uint32(i)] = blockheader
+		}
+	}
+
 	for i := s.startBlock; i <= s.endBlock; i++ {
 		if s.closed.Load().(bool) {
 			log.Info("[block sync]Receiving shutdown requested")
@@ -62,23 +73,13 @@ func (s *Server) SyncBlocks() {
 			return
 		}
 
-		blockHash, err := s.rpcBackend.GetBlockHash(uint64(i))
-		if err != nil {
-			log.Errorf("get block hash failed: %s", err)
-			return
-		}
+		blockheader := s.getBlockHeader(i)
 
-		// for block header cache
-		blockheader, err := s.rpcBackend.GetBlockheader(blockHash)
-		if err != nil {
-			log.Errorf("get block header failed: %s", err)
-			return
-		}
 		s.mtx.Lock()
 		s.headers[uint32(i)] = blockheader
 		s.mtx.Unlock()
 
-		rawBlock, err := s.rpcBackend.GetRawBlock(blockHash)
+		rawBlock, err := s.rpcBackend.GetRawBlock(blockheader.Hash)
 		if err != nil {
 			log.Errorf("get block failed: %s", err)
 			return
@@ -190,12 +191,31 @@ func (s *Server) start() {
 			}
 		}
 
+		s.bestHeight = int(block.height)
+
 		log.Infof("Handle block %s:%d, inputs: %d, outputs: %d, utxo read: %f(%d), utxo write: %f(%d), utxo delete: %f(%d), "+
 			"address read: %f(%d) address write: %f(%d)", block.block.BlockHash().String(), block.height, inputs, outputs, utxoRead,
 			utxoReadCount, utxoWrite, utxoWriteCount, utxoDel, utxoDelCount, addressRead, addressReadCount, addressWrite, addressWriteCount)
 	}
 
 exit:
+}
+
+func (s *Server) getBlockHeader(blockHeight int) *bitcoind.BlockHeader{
+	blockHash, err := s.rpcBackend.GetBlockHash(uint64(blockHeight))
+	if err != nil {
+		log.Errorf("get block hash failed: %s", err)
+		return nil
+	}
+
+	// for block header cache
+	blockheader, err := s.rpcBackend.GetBlockheader(blockHash)
+	if err != nil {
+		log.Errorf("get block header failed: %s", err)
+		return nil
+	}
+
+	return blockheader
 }
 
 // FetchPayment aims to get incoming and outgoings for a single bitcoin address.
@@ -313,6 +333,13 @@ func (s *Server) shutdown() {
 	if err != nil {
 		log.Errorf("flush utxo and address cache failed: %s", err)
 	}
+
+	log.Infof("write the best block height: %d", s.bestHeight)
+	err = s.db.Put(nil, bestHeightKey, []byte(strconv.Itoa(s.bestHeight)))
+	if err != nil {
+		log.Errorf("write the best block height failed: %s", err)
+	}
+
 	log.Info("Flush cache completed!")
 
 	err = s.db.Shutdown()
@@ -497,6 +524,7 @@ func (s *Server) receive(txHash *chainhash.Hash, view *UtxoView, payment map[str
 			start := time.Now()
 			value, err := s.db.Get(addressBucket, script)
 			if err != nil {
+				// handle NotFoundError specially
 				if err == database.NotFoundError {
 					value = nil
 				} else {
@@ -648,8 +676,7 @@ func NewServer() (*Server, error) {
 		utxoCache:      lru.New(utxoCacheSize, true),
 		addressCache:   lru.New(addressCacheSize, false),
 
-		startBlock: viper.GetInt("server.task.start"),
-		endBlock:   viper.GetInt("server.task.end"),
+		endBlock: viper.GetInt("server.task.end"),
 
 		done:      make(chan bool, blockCacheSize),
 		interrupt: make(chan os.Signal, 1),
@@ -662,6 +689,24 @@ func NewServer() (*Server, error) {
 	s.addressCache.ForEach = s.flushAddressLRUCache
 
 	s.headers = make(map[uint32]*bitcoind.BlockHeader)
+
+	// recover the last synced height if existed
+	value, err := s.db.Get(nil, bestHeightKey)
+	if err != nil {
+		if err == database.NotFoundError {
+			s.startBlock = 0
+		} else {
+			return nil, errors.New("fetch the best synced block height failed: " + err.Error())
+		}
+	}
+	if value != nil {
+		bestHeight, err := strconv.Atoi(string(value))
+		if err != nil {
+			return nil, errors.New("invalid number(block height)")
+		}
+		s.startBlock = bestHeight + 1
+	}
+	log.Infof("bitstate will sync from block height: %d", s.startBlock)
 
 	signal.Notify(s.interrupt, syscall.SIGINT, syscall.SIGTERM)
 

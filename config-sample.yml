@@ -17,7 +17,6 @@ server:
       dbpath: .data/bitstate.db
     leveldb:
   task:
-    start: 0
     end: 200000
   cache:
     utxo: 200000
