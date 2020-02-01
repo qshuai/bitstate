@@ -18,8 +18,8 @@ const (
 var (
 	log btclog.Logger
 
-	addressBucket = []byte("address")
-	utxoBucket    = []byte("utxo")
+	addressBucket = []byte("a")
+	utxoBucket    = []byte("u")
 
 	// cache size default value
 	utxoCacheSize    = 1200000

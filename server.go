@@ -17,9 +17,11 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/qshuai/bitstate/database"
 	"github.com/qshuai/bitstate/database/bboltdb"
+	leveldb_go "github.com/qshuai/bitstate/database/leveldb"
 	"github.com/qshuai/go-bitcoind"
 	"github.com/qshuai/lru"
 	"github.com/spf13/viper"
+	"github.com/syndtr/goleveldb/leveldb/opt"
 	"go.etcd.io/bbolt"
 )
 
@@ -615,7 +617,13 @@ func NewServer() (*Server, error) {
 		db = bboltDB
 
 	case database.LeveldbDriver:
+		dbPath := viper.GetString("server.db.leveldb.dbpath")
+		levelDB, err := leveldb_go.New(dbPath, &opt.Options{})
+		if err != nil {
+			return nil, err
+		}
 
+		db = levelDB
 	default:
 
 	}
