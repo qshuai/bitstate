@@ -61,8 +61,14 @@ func (s *Server) SyncBlocks() {
 	// sync blockheader
 	if s.startBlock != 0 {
 		for i := 0; i < s.startBlock; i++ {
-			blockheader := s.getBlockHeader(i)
+			blockheader, err := s.getBlockHeader(i)
+			if err != nil {
+				return
+			}
+
+			s.mtx.Lock()
 			s.headers[uint32(i)] = blockheader
+			s.mtx.Unlock()
 		}
 	}
 
@@ -73,7 +79,10 @@ func (s *Server) SyncBlocks() {
 			return
 		}
 
-		blockheader := s.getBlockHeader(i)
+		blockheader, err := s.getBlockHeader(i)
+		if err != nil {
+			return
+		}
 
 		s.mtx.Lock()
 		s.headers[uint32(i)] = blockheader
@@ -201,21 +210,21 @@ func (s *Server) start() {
 exit:
 }
 
-func (s *Server) getBlockHeader(blockHeight int) *bitcoind.BlockHeader{
+func (s *Server) getBlockHeader(blockHeight int) (*bitcoind.BlockHeader, error) {
 	blockHash, err := s.rpcBackend.GetBlockHash(uint64(blockHeight))
 	if err != nil {
 		log.Errorf("get block hash failed: %s", err)
-		return nil
+		return nil, err
 	}
 
 	// for block header cache
 	blockheader, err := s.rpcBackend.GetBlockheader(blockHash)
 	if err != nil {
 		log.Errorf("get block header failed: %s", err)
-		return nil
+		return nil, err
 	}
 
-	return blockheader
+	return blockheader, nil
 }
 
 // FetchPayment aims to get incoming and outgoings for a single bitcoin address.
@@ -664,6 +673,10 @@ func NewServer() (*Server, error) {
 		false)
 	if err != nil {
 		return nil, err
+	}
+	_, err = bc.GetBestBlockhash()
+	if err != nil {
+		return nil, errors.New("the tcp connection to bitcoin core unreached: " + err.Error())
 	}
 
 	utxoCacheSize = viper.GetInt("server.cache.utxo")
