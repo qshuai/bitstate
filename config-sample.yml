@@ -12,10 +12,12 @@ server:
     level: debug
     log-path: logs
   db:
+    # bbolt, level
     driver: bboltdb
     bbolt:
       dbpath: .data/bitstate.db
     leveldb:
+      dbpath: .data
   task:
     end: 200000
   cache:
