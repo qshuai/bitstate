@@ -11,4 +11,5 @@ require (
 	github.com/spf13/viper v1.6.2
 	github.com/syndtr/goleveldb v1.0.0
 	go.etcd.io/bbolt v1.3.3
+	go.uber.org/atomic v1.4.0
 )

@@ -2,15 +2,12 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"os"
-	"os/signal"
 	"strconv"
 	"sync"
-	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/btcsuite/btcd/blockchain"
@@ -24,12 +21,19 @@ import (
 	"github.com/spf13/viper"
 	"github.com/syndtr/goleveldb/leveldb/opt"
 	"go.etcd.io/bbolt"
+	"go.uber.org/atomic"
 )
+
+var addressMapping = make(map[string]struct{}, 5000000)
 
 type Server struct {
 	bestHeight int
 
-	db             database.DB
+	// db stores utxo and address info
+	db database.DB
+	// addressDB stores addresses on blockchain and the relationship to shortened hash,
+	// and this database is responsible for reading address, bboltdb recommended.
+	addressDB      database.DB
 	rpcBackend     *bitcoind.Bitcoind
 	blockContainer chan *Block
 
@@ -44,13 +48,11 @@ type Server struct {
 	startBlock int
 	endBlock   int
 
-	closed atomic.Value
+	closed atomic.Bool
 	done   chan bool
-
-	interrupt chan os.Signal
 }
 
-func (s *Server) SyncBlocks() {
+func (s *Server) syncBlocks() {
 	defer func() {
 		// the channel should be closed by producer
 		close(s.blockContainer)
@@ -58,22 +60,22 @@ func (s *Server) SyncBlocks() {
 		log.Debug("Sync block goroutine exit")
 	}()
 
-	// sync blockheader
+	// sync blockHeader
 	if s.startBlock != 0 {
 		for i := 0; i < s.startBlock; i++ {
-			blockheader, err := s.getBlockHeader(i)
+			blockHeader, err := s.getBlockHeader(i)
 			if err != nil {
 				return
 			}
 
 			s.mtx.Lock()
-			s.headers[uint32(i)] = blockheader
+			s.headers[uint32(i)] = blockHeader
 			s.mtx.Unlock()
 		}
 	}
 
 	for i := s.startBlock; i <= s.endBlock; i++ {
-		if s.closed.Load().(bool) {
+		if s.closed.Load() {
 			log.Info("[block sync]Receiving shutdown requested")
 			s.done <- true
 			return
@@ -116,10 +118,16 @@ func (s *Server) SyncBlocks() {
 
 func (s *Server) start() {
 	// the goroutine be responsible for get block and put to cache
-	go s.SyncBlocks()
+	go s.syncBlocks()
 
 	var inputs, outputs int
 	for block := range s.blockContainer {
+		select {
+		case <-s.done:
+			return
+		default:
+		}
+
 		inputs, outputs = 0, 0
 
 		utxoReadCount, utxoWriteCount, utxoDelCount = 0, 0, 0
@@ -127,27 +135,11 @@ func (s *Server) start() {
 		addressReadCount, addressWriteCount = 0, 0
 		addressRead, addressWrite = 0, 0
 
-		select {
-		case <-s.interrupt:
-			log.Info("Receiving interrupt signal, preparing exit program")
-			// notify block sync goroutine should exit
-			s.closed.Store(true)
-
-			// fetch a entry from block container channel avoiding to block SyncBlocks goroutine
-			<-s.blockContainer
-
-			// wait sync block goroutine exit complete
-			<-s.done
-
-			goto exit
-		default:
-		}
-
 		for _, tx := range block.block.Transactions {
 			inputs += len(tx.TxIn)
 			outputs += len(tx.TxOut)
 
-			payment, viewCache, err := s.FetchPayment(tx)
+			payment, viewCache, err := s.fetchPayment(tx)
 			if err != nil {
 				log.Errorf("Fetch payment information failed: %s", err)
 				return
@@ -206,11 +198,11 @@ func (s *Server) start() {
 			"address read: %f(%d) address write: %f(%d)", block.block.BlockHash().String(), block.height, inputs, outputs, utxoRead,
 			utxoReadCount, utxoWrite, utxoWriteCount, utxoDel, utxoDelCount, addressRead, addressReadCount, addressWrite, addressWriteCount)
 	}
-
-exit:
 }
 
 func (s *Server) getBlockHeader(blockHeight int) (*bitcoind.BlockHeader, error) {
+	// todo<qshuai> fetch headers by local file firstly
+
 	blockHash, err := s.rpcBackend.GetBlockHash(uint64(blockHeight))
 	if err != nil {
 		log.Errorf("get block hash failed: %s", err)
@@ -233,7 +225,7 @@ func (s *Server) getBlockHeader(blockHeight int) (*bitcoind.BlockHeader, error) 
 // The amount will be a positive number if an address receiving some coin. On
 // the contrary, the amount will be a negative number if an address spending some
 // coin.
-func (s *Server) FetchPayment(tx *wire.MsgTx) (map[string]int64, []*UtxoView, error) {
+func (s *Server) fetchPayment(tx *wire.MsgTx) (map[string]int64, []*UtxoView, error) {
 	payment := make(map[string]int64)
 	viewCache := make([]*UtxoView, len(tx.TxIn))
 
@@ -336,27 +328,6 @@ func (s *Server) fetchUtxo(input *wire.TxIn) (*UtxoView, error) {
 	}
 }
 
-func (s *Server) shutdown() {
-	log.Info("Flush cache before exiting")
-	err := s.flushCache()
-	if err != nil {
-		log.Errorf("flush utxo and address cache failed: %s", err)
-	}
-
-	log.Infof("write the best block height: %d", s.bestHeight)
-	err = s.db.Put(nil, bestHeightKey, []byte(strconv.Itoa(s.bestHeight)))
-	if err != nil {
-		log.Errorf("write the best block height failed: %s", err)
-	}
-
-	log.Info("Flush cache completed!")
-
-	err = s.db.Shutdown()
-	if err != nil {
-		log.Errorf("close bboltdb database failed: %s", err)
-	}
-}
-
 func (s *Server) carryUtxoCache(entry lru.Item) error {
 	view := entry.(*UtxoViewCache)
 	key, _ := hex.DecodeString(view.key)
@@ -427,7 +398,10 @@ func (s *Server) spend(txHash *chainhash.Hash, view *UtxoView, payment map[strin
 	}
 
 	for _, script := range scripts {
-		cacheKey := generateAddressKey(script)
+		shortenedKey, cacheKey, _, err := s.generateAddressKey(script)
+		if err != nil {
+			return err
+		}
 
 		// get payment information
 		amountDiff, ok := payment[hex.EncodeToString(script)]
@@ -450,7 +424,7 @@ func (s *Server) spend(txHash *chainhash.Hash, view *UtxoView, payment map[strin
 			// search from backend database
 			addressReadCount++
 			start := time.Now()
-			value, err := s.db.Get(addressBucket, script)
+			value, err := s.db.Get(addressBucket, shortenedKey)
 			if err != nil {
 				if err == database.NotFoundError {
 					return errors.New("address entry not found: " + cacheKey)
@@ -507,7 +481,10 @@ func (s *Server) receive(txHash *chainhash.Hash, view *UtxoView, payment map[str
 	}
 
 	for _, script := range scripts {
-		cacheKey := generateAddressKey(script)
+		shortenedKey, cacheKey, existed, err := s.generateAddressKey(script)
+		if err != nil {
+			return err
+		}
 
 		// get payment information
 		amountDiff, ok := payment[hex.EncodeToString(script)]
@@ -529,18 +506,21 @@ func (s *Server) receive(txHash *chainhash.Hash, view *UtxoView, payment map[str
 		} else {
 
 			// search from backend database
-			addressReadCount++
-			start := time.Now()
-			value, err := s.db.Get(addressBucket, script)
-			if err != nil {
-				// handle NotFoundError specially
-				if err == database.NotFoundError {
-					value = nil
-				} else {
-					return err
+			var value []byte
+			if existed {
+				addressReadCount++
+				start := time.Now()
+				value, err = s.db.Get(addressBucket, shortenedKey)
+				if err != nil {
+					// handle NotFoundError specially
+					if err == database.NotFoundError {
+						value = nil
+					} else {
+						return err
+					}
 				}
+				addressRead += time.Now().Sub(start).Seconds()
 			}
-			addressRead += time.Now().Sub(start).Seconds()
 
 			if value != nil {
 				var info AddressBalanceInfo
@@ -602,6 +582,29 @@ func (s *Server) receiveCoin(txHash *chainhash.Hash, view *UtxoView, amountDiff 
 	return nil
 }
 
+func (s *Server) stop() {
+	s.closed.Store(true)
+
+	log.Info("Flush cache before exiting")
+	err := s.flushCache()
+	if err != nil {
+		log.Errorf("flush utxo and address cache failed: %s", err)
+	}
+
+	log.Infof("write the best block height: %d", s.bestHeight)
+	err = s.db.Put(nil, bestHeightKey, []byte(strconv.Itoa(s.bestHeight)))
+	if err != nil {
+		log.Errorf("write the best block height failed: %s", err)
+	}
+
+	log.Info("Flush cache completed!")
+
+	err = s.db.Shutdown()
+	if err != nil {
+		log.Errorf("close database failed: %s", err)
+	}
+}
+
 func generateUtxoKey(txHash *chainhash.Hash, idx uint32) []byte {
 	shash := shortHash(txHash)
 	index := CompressedUint32(idx)
@@ -613,8 +616,38 @@ func generateUtxoKey(txHash *chainhash.Hash, idx uint32) []byte {
 	return buf.Bytes()
 }
 
-func generateAddressKey(script []byte) string {
-	return hex.EncodeToString(getSafeScript(script))
+func (s *Server) generateAddressKey(script []byte) ([]byte, string, bool, error) {
+	if len(script) <= 0 {
+		// todo confirm true
+		return dummyScript, hex.EncodeToString(getSafeScript(script)), true, nil
+	}
+
+	// shorten hash
+	sum := sha256.Sum256(script)
+	target := sum[:6]
+	//_, err := s.addressDB.Get(addressListBucket, target)
+	//existed := true
+	//if err != nil {
+	//	if err == database.NotFoundError {
+	//		// store
+	//		err = s.addressDB.Put(addressListBucket, target, script)
+	//		if err != nil {
+	//			return nil, "", false, err
+	//		}
+	//		existed = false
+	//	} else {
+	//		return nil, "", false, err
+	//	}
+	//}
+	key := hex.EncodeToString(target)
+	_, ok := addressMapping[key]
+	existed := true
+	if !ok {
+		existed = false
+		addressMapping[key] = struct{}{}
+	}
+
+	return target, key, existed, nil
 }
 
 func getSafeScript(script []byte) []byte {
@@ -623,6 +656,27 @@ func getSafeScript(script []byte) []byte {
 	}
 
 	return script
+}
+
+func newAddressListDB() (database.DB, error) {
+	dbFile := viper.GetString("server.db.bbolt.dbpath")
+	bboltDB, err := bboltdb.New(dbFile, &bbolt.Options{
+		Timeout:      0,
+		NoGrowSync:   false,
+		FreelistType: bbolt.FreelistArrayType,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// initialize necessary bucket
+	err = bboltDB.InitBucket(addressListBucket)
+	if err != nil {
+		log.Errorf("Create necessary db bucket failed: %s", err)
+		return nil, err
+	}
+
+	return bboltDB, nil
 }
 
 func NewServer() (*Server, error) {
@@ -649,6 +703,7 @@ func NewServer() (*Server, error) {
 		err = bboltDB.InitBucket(utxoBucket, addressBucket)
 		if err != nil {
 			log.Errorf("Create necessary db bucket failed: %s", err)
+			return nil, err
 		}
 
 		db = bboltDB
@@ -662,7 +717,12 @@ func NewServer() (*Server, error) {
 
 		db = levelDB
 	default:
+		return nil, errors.New("invalid database driver")
+	}
 
+	addressListDB, err := newAddressListDB()
+	if err != nil {
+		return nil, err
 	}
 
 	bc, err := bitcoind.New(
@@ -684,6 +744,7 @@ func NewServer() (*Server, error) {
 
 	s := &Server{
 		db:             db,
+		addressDB:      addressListDB,
 		rpcBackend:     bc,
 		blockContainer: make(chan *Block, blockCacheSize),
 		utxoCache:      lru.New(utxoCacheSize, true),
@@ -691,8 +752,7 @@ func NewServer() (*Server, error) {
 
 		endBlock: viper.GetInt("server.task.end"),
 
-		done:      make(chan bool, blockCacheSize),
-		interrupt: make(chan os.Signal, 1),
+		done: make(chan bool, blockCacheSize),
 	}
 	s.closed.Store(false)
 	s.utxoCache.Callback = s.carryUtxoCache
@@ -720,8 +780,6 @@ func NewServer() (*Server, error) {
 		s.startBlock = bestHeight + 1
 	}
 	log.Infof("bitstate will sync from block height: %d", s.startBlock)
-
-	signal.Notify(s.interrupt, syscall.SIGINT, syscall.SIGTERM)
 
 	return s, nil
 }
