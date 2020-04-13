@@ -262,7 +262,7 @@ func (s *Server) fetchPayment(tx *wire.MsgTx) (map[string]int64, []*UtxoView, er
 	}
 
 	for _, output := range tx.TxOut {
-		scripts, err := generateCanonicalScript(output.PkScript)
+		scripts, err := generateCanonicalScript(getSafeScript(output.PkScript))
 		if err != nil {
 			return nil, nil, err
 		}
