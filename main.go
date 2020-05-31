@@ -15,34 +15,12 @@ import (
 const (
 	logFile = "bitstate.log"
 
+	// blockCacheSize the channel holds the number of block.
 	blockCacheSize = 5
 )
 
 var (
 	log btclog.Logger
-
-	addressBucket = []byte("a")
-	utxoBucket    = []byte("u")
-	addressListBucket = []byte("l")
-	bestHeightKey = []byte("bestheight")
-
-	// cache size default value
-	utxoCacheSize    = 1200000
-	addressCacheSize = 50000
-
-	utxoReadCount  int     = 0
-	utxoRead       float64 = 0
-	utxoWriteCount         = 0
-	utxoWrite      float64 = 0
-	utxoDelCount           = 0
-	utxoDel        float64 = 0
-
-	addressReadCount  int     = 0
-	addressRead       float64 = 0
-	addressWriteCount int     = 0
-	addressWrite      float64 = 0
-
-	dummyScript = []byte{0, 0, 0, 0}
 )
 
 type Block struct {
@@ -51,20 +29,22 @@ type Block struct {
 }
 
 func main() {
-	// read config file
-	viper.SetConfigFile("config.yml")
-	viper.SetConfigType("yml")
-	viper.AddConfigPath("./")
-	err := viper.ReadInConfig()
-	if err != nil {
-		fmt.Println("Read config file failed:", err)
-		os.Exit(1)
+	{
+		// read config file
+		viper.SetConfigFile("config.yml")
+		viper.SetConfigType("yml")
+		viper.AddConfigPath("./")
+		err := viper.ReadInConfig()
+		if err != nil {
+			fmt.Println("Read config file failed:", err)
+			os.Exit(1)
+		}
 	}
 
-	// setup log
 	{
+		// setup log
 		logPath := viper.GetString("server.log.log-path")
-		_, err = os.Stat(logPath)
+		_, err := os.Stat(logPath)
 		if err != nil {
 			if os.IsNotExist(err) {
 				err = os.Mkdir(logPath, os.ModePerm)
@@ -82,6 +62,7 @@ func main() {
 			fmt.Println("Open logger file failed: ", err)
 			os.Exit(1)
 		}
+
 		log = btclog.NewBackend(file).Logger("")
 		levelConf := viper.GetString("server.log.level")
 		level, ok := btclog.LevelFromString(levelConf)
@@ -97,15 +78,19 @@ func main() {
 		log.Errorf("New server instance failed: %s", err)
 		os.Exit(1)
 	}
-	go func() {
-		interrupt := make(chan os.Signal, 1)
-		signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM)
-		select {
-		case <-interrupt:
-			log.Info("Receiving interrupt signal, preparing exit program")
-			server.stop()
-		}
-	}()
+
+	{
+		// exit gracefully
+		go func() {
+			interrupt := make(chan os.Signal, 1)
+			signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM)
+			select {
+			case <-interrupt:
+				log.Info("Receiving interrupt signal, preparing exit program")
+				server.stop()
+			}
+		}()
+	}
 
 	server.start()
 }

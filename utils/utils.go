@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 )
 
+// MkDirAndFile mkdir if the directory not exist.
 func MkDirAndFile(filePath string) error {
 	dir := filepath.Dir(filePath)
 	_, err := os.Stat(dir)
