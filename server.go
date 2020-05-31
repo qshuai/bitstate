@@ -147,11 +147,19 @@ func (s *Server) start() {
 	go s.syncBlocks()
 
 	var inputs, outputs int
-	for block := range s.blockContainer {
+	for {
+		var block *Block
+		var ok bool
 		select {
+		case block, ok = <-s.blockContainer:
+			if !ok {
+				// the producer has been closed
+				log.Info("Handler block completed")
+				s.stop()
+				return
+			}
 		case <-s.done:
 			return
-		default:
 		}
 
 		inputs, outputs = 0, 0
