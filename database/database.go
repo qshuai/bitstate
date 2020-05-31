@@ -3,7 +3,8 @@ package database
 import "errors"
 
 var (
-	NotFoundError = errors.New("not found")
+	ErrNotFound    = errors.New("not found")
+	ErrEmptyBucket = errors.New("empty bucket")
 )
 
 type DB interface {
@@ -11,5 +12,6 @@ type DB interface {
 	Get(bucket []byte, key []byte) ([]byte, error)
 	Update(bucket []byte, key []byte, newValue []byte) error
 	Remove(bucket []byte, key []byte) error
+	Clean(bucket []byte) error
 	Shutdown() error
 }

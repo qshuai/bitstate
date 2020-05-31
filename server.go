@@ -324,7 +324,7 @@ func (s *Server) fetchUtxo(input *wire.TxIn) (*UtxoView, error) {
 		utxoReadCount++
 		value, err := s.db.Get(utxoBucket, utxoDBKey)
 		if err != nil {
-			if err == database.NotFoundError {
+			if err == database.ErrNotFound {
 				return nil, errors.New(fmt.Sprintf("utxo entry not found in database: %s:%d(%s)",
 					outpoint.Hash.String(), outpoint.Index, hex.EncodeToString(utxoDBKey)))
 			}
@@ -451,7 +451,7 @@ func (s *Server) spend(txHash *chainhash.Hash, view *UtxoView, payment map[strin
 			start := time.Now()
 			value, err := s.db.Get(addressBucket, shortenedKey)
 			if err != nil {
-				if err == database.NotFoundError {
+				if err == database.ErrNotFound {
 					return errors.New("address entry not found: " + cacheKey)
 				}
 
@@ -537,8 +537,8 @@ func (s *Server) receive(txHash *chainhash.Hash, view *UtxoView, payment map[str
 				start := time.Now()
 				value, err = s.db.Get(addressBucket, shortenedKey)
 				if err != nil {
-					// handle NotFoundError specially
-					if err == database.NotFoundError {
+					// handle ErrNotFound specially
+					if err == database.ErrNotFound {
 						value = nil
 					} else {
 						return err
@@ -628,7 +628,7 @@ func (s *Server) stop() {
 	if err != nil {
 		log.Errorf("close database failed: %s", err)
 	}
-	
+
 	s.wg.Done()
 }
 
@@ -655,7 +655,7 @@ func (s *Server) generateAddressKey(script []byte) ([]byte, string, bool, error)
 	//_, err := s.addressDB.Get(addressListBucket, target)
 	//existed := true
 	//if err != nil {
-	//	if err == database.NotFoundError {
+	//	if err == database.ErrNotFound {
 	//		// store
 	//		err = s.addressDB.Put(addressListBucket, target, script)
 	//		if err != nil {
@@ -798,7 +798,7 @@ func NewServer() (*Server, error) {
 	// recover the last synced height if existed
 	value, err := server.db.Get(nil, bestHeightKey)
 	if err != nil {
-		if err == database.NotFoundError {
+		if err == database.ErrNotFound {
 			server.startBlock = 0
 		} else {
 			return nil, errors.New("fetch the best synced block height failed: " + err.Error())
@@ -812,6 +812,14 @@ func NewServer() (*Server, error) {
 		server.startBlock = bestHeight + 1
 	}
 	log.Infof("bitstate will sync from block height: %d", server.startBlock)
+
+	// clean existed address info data if start block height is 0
+	if server.startBlock == 0 {
+		err = server.db.Clean(addressBucket)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	return server, nil
 }
