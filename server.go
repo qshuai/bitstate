@@ -20,6 +20,7 @@ import (
 	"github.com/qshuai/go-bitcoind"
 	"github.com/qshuai/lru"
 	"github.com/spf13/viper"
+	"github.com/syndtr/goleveldb/leveldb/filter"
 	"github.com/syndtr/goleveldb/leveldb/opt"
 	"go.etcd.io/bbolt"
 )
@@ -737,7 +738,9 @@ func NewServer() (*Server, error) {
 
 	case database.LeveldbDriver:
 		dbPath := viper.GetString("server.db.leveldb.dbpath")
-		levelDB, err := leveldb.New(dbPath, &opt.Options{})
+		levelDB, err := leveldb.New(dbPath, &opt.Options{
+			Filter: filter.NewBloomFilter(32),
+		})
 		if err != nil {
 			return nil, err
 		}
