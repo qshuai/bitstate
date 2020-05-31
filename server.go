@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/btcsuite/btcd/blockchain"
@@ -21,7 +22,6 @@ import (
 	"github.com/spf13/viper"
 	"github.com/syndtr/goleveldb/leveldb/opt"
 	"go.etcd.io/bbolt"
-	"go.uber.org/atomic"
 )
 
 var (
@@ -71,7 +71,7 @@ type Server struct {
 	startBlock int
 	endBlock   int
 
-	closed atomic.Bool
+	closed atomic.Value
 	done   chan bool
 }
 
@@ -98,7 +98,7 @@ func (s *Server) syncBlocks() {
 	}
 
 	for i := s.startBlock; i <= s.endBlock; i++ {
-		if s.closed.Load() {
+		if s.closed.Load().(bool) {
 			log.Info("[block sync]Receiving shutdown requested")
 			s.done <- true
 			return
