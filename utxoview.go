@@ -7,6 +7,13 @@ import (
 	"github.com/btcsuite/btcd/wire"
 )
 
+const (
+	UnSpendTag uint8 = iota
+	SpendTag
+
+	CoinbaseFlag uint32 = 0x01
+)
+
 type UtxoView struct {
 	isFromCoinbase bool
 	height         uint32
@@ -23,9 +30,9 @@ func (view *UtxoView) encode() ([]byte, error) {
 	w.Write(PutUint32(view.compactCoinbaseAndHeight()))
 	w.Write(PutUint64(uint64(view.amount)))
 	if view.spent {
-		w.Write(PutUint8(1))
+		w.Write(PutUint8(SpendTag))
 	} else {
-		w.Write(PutUint8(0))
+		w.Write(PutUint8(UnSpendTag))
 	}
 	err := wire.WriteVarInt(w, 0, uint64(varLen))
 	if err != nil {
@@ -47,10 +54,10 @@ func (view *UtxoView) decode(value []byte) error {
 		return err
 	}
 
-	view.isFromCoinbase = coinbaseAndHeight&0x01 == 1
-	view.height = coinbaseAndHeight / 2
+	view.isFromCoinbase = coinbaseAndHeight&CoinbaseFlag != 0
+	view.height = coinbaseAndHeight >> 1
 	view.amount = int64(amount)
-	view.spent = value[12] == 1
+	view.spent = value[12] == SpendTag
 	view.pkScript = value[13+wire.VarIntSerializeSize(length):]
 
 	return nil
@@ -58,8 +65,8 @@ func (view *UtxoView) decode(value []byte) error {
 
 func (view *UtxoView) compactCoinbaseAndHeight() uint32 {
 	if view.isFromCoinbase {
-		return view.height*2 | 1
+		return view.height<<1 | CoinbaseFlag
 	}
 
-	return view.height * 2
+	return view.height << 1
 }

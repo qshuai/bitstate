@@ -24,6 +24,31 @@ import (
 	"go.uber.org/atomic"
 )
 
+var (
+	// cache size default value
+	utxoCacheSize    = 1200000
+	addressCacheSize = 50000
+
+	addressBucket     = []byte("a")
+	utxoBucket        = []byte("u")
+	addressListBucket = []byte("l")
+	bestHeightKey     = []byte("bestheight")
+
+	utxoReadCount          = 0
+	utxoRead       float64 = 0
+	utxoWriteCount         = 0
+	utxoWrite      float64 = 0
+	utxoDelCount           = 0
+	utxoDel        float64 = 0
+
+	addressReadCount          = 0
+	addressRead       float64 = 0
+	addressWriteCount         = 0
+	addressWrite      float64 = 0
+
+	dummyScript = []byte{0, 0, 0, 0}
+)
+
 var addressMapping = make(map[string]struct{}, 5000000)
 
 type Server struct {
@@ -31,13 +56,15 @@ type Server struct {
 
 	// db stores utxo and address info
 	db database.DB
+
 	// addressDB stores addresses on blockchain and the relationship to shortened hash,
 	// and this database is responsible for reading address, bboltdb recommended.
-	addressDB      database.DB
+	addressDB database.DB
+
 	rpcBackend     *bitcoind.Bitcoind
 	blockContainer chan *Block
 
-	// cache
+	// lru cache
 	utxoCache    *lru.Cache
 	addressCache *lru.Cache
 
@@ -262,7 +289,7 @@ func (s *Server) fetchPayment(tx *wire.MsgTx) (map[string]int64, []*UtxoView, er
 	}
 
 	for _, output := range tx.TxOut {
-		scripts, err := generateCanonicalScript(output.PkScript)
+		scripts, err := generateCanonicalScript(getSafeScript(output.PkScript))
 		if err != nil {
 			return nil, nil, err
 		}

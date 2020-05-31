@@ -6,19 +6,30 @@ import (
 	"github.com/btcsuite/btcd/wire"
 )
 
-type AddressBalanceInfo struct {
-	received    int64
-	send        int64
-	txes        uint32
-	unspentTxes uint32
-	created     uint32
-	updated     uint32
+const (
+	// AddressBalanceInfoEncodeSize represents the encoded size of struct
+	// of AddressBalanceInfo. 8 bytes for `received` field, 8 bytes for
+	// `send`, and `txes`,`unspentTxes`, `created`, `updated` will be allocate
+	// 4 bytes respectively.
+	AddressBalanceInfoEncodeSize = 8 + 8 + 4 + 4 + 4 + 4 // 32 bytes
+)
 
-	bestTxHash string // short hash represent the transaction hash
+// AddressBalanceInfo represents the balance and transaction
+// state of the synced blockchain height.
+type AddressBalanceInfo struct {
+	received    int64  // received coins in Satoshi
+	send        int64  // sent coins in Satoshi
+	txes        uint32 // the number of transactions
+	unspentTxes uint32 // the number of utxo
+	created     uint32 // the time when the address appears on blockchain for the first time
+	updated     uint32 // the time when the address transaction on blockchain recently
+
+	bestTxHash string // short hash representing the tx hash
 }
 
+// Encode encodes an address info into 32 bytes.
 func (info *AddressBalanceInfo) Encode() []byte {
-	r := make([]byte, 32)
+	r := make([]byte, AddressBalanceInfoEncodeSize)
 	binary.LittleEndian.PutUint64(r[0:8], uint64(info.received))
 	binary.LittleEndian.PutUint64(r[8:16], uint64(info.send))
 	binary.LittleEndian.PutUint32(r[16:20], info.txes)
@@ -29,6 +40,7 @@ func (info *AddressBalanceInfo) Encode() []byte {
 	return r
 }
 
+// Decode decodes 32 bytes into a readable info.
 func (info *AddressBalanceInfo) Decode(value []byte) {
 	info.received = int64(binary.LittleEndian.Uint64(value[0:8]))
 	info.send = int64(binary.LittleEndian.Uint64(value[8:16]))
@@ -38,6 +50,7 @@ func (info *AddressBalanceInfo) Decode(value []byte) {
 	info.updated = binary.LittleEndian.Uint32(value[28:32])
 }
 
+// receiveCoin receives an utxo.
 func (info *AddressBalanceInfo) receiveCoin(txHash string, blockTime uint32,
 	out *wire.TxOut, isFirst bool) {
 
@@ -55,6 +68,7 @@ func (info *AddressBalanceInfo) receiveCoin(txHash string, blockTime uint32,
 	info.updated = blockTime
 }
 
+// spendCoin spends an utxo.
 func (info *AddressBalanceInfo) spendCoin(txHash string, blockTime uint32, value int64) {
 	if info.bestTxHash != txHash {
 		info.txes++
