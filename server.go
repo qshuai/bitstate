@@ -766,7 +766,7 @@ func NewServer() (*Server, error) {
 	utxoCacheSize := viper.GetInt("server.cache.utxo")
 	addressCacheSize := viper.GetInt("server.cache.address")
 
-	s := &Server{
+	server := &Server{
 		db:             db,
 		addressDB:      addressListDB,
 		rpcBackend:     bc,
@@ -778,20 +778,20 @@ func NewServer() (*Server, error) {
 
 		done: make(chan bool, 1),
 	}
-	s.closed.Store(false)
-	s.utxoCache.Callback = s.carryUtxoCache
-	s.addressCache.Callback = s.carryAddressCache
+	server.closed.Store(false)
+	server.utxoCache.Callback = server.carryUtxoCache
+	server.addressCache.Callback = server.carryAddressCache
 
-	s.utxoCache.ForEach = s.flushUtxoLRUCache
-	s.addressCache.ForEach = s.flushAddressLRUCache
+	server.utxoCache.ForEach = server.flushUtxoLRUCache
+	server.addressCache.ForEach = server.flushAddressLRUCache
 
-	s.headers = make(map[uint32]*bitcoind.BlockHeader)
+	server.headers = make(map[uint32]*bitcoind.BlockHeader, server.endBlock)
 
 	// recover the last synced height if existed
-	value, err := s.db.Get(nil, bestHeightKey)
+	value, err := server.db.Get(nil, bestHeightKey)
 	if err != nil {
 		if err == database.NotFoundError {
-			s.startBlock = 0
+			server.startBlock = 0
 		} else {
 			return nil, errors.New("fetch the best synced block height failed: " + err.Error())
 		}
@@ -801,9 +801,9 @@ func NewServer() (*Server, error) {
 		if err != nil {
 			return nil, errors.New("invalid number(block height)")
 		}
-		s.startBlock = bestHeight + 1
+		server.startBlock = bestHeight + 1
 	}
-	log.Infof("bitstate will sync from block height: %d", s.startBlock)
+	log.Infof("bitstate will sync from block height: %d", server.startBlock)
 
-	return s, nil
+	return server, nil
 }
