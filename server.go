@@ -25,28 +25,24 @@ import (
 )
 
 var (
-	// cache size default value
-	utxoCacheSize    = 1200000
-	addressCacheSize = 50000
-
 	addressBucket     = []byte("a")
 	utxoBucket        = []byte("u")
 	addressListBucket = []byte("l")
 	bestHeightKey     = []byte("bestheight")
 
-	utxoReadCount          = 0
-	utxoRead       float64 = 0
-	utxoWriteCount         = 0
-	utxoWrite      float64 = 0
-	utxoDelCount           = 0
-	utxoDel        float64 = 0
+	dummyScript = []byte{0, 0, 0, 0}
 
+	// the following items are trace indicator
+	utxoReadCount             = 0
+	utxoRead          float64 = 0
+	utxoWriteCount            = 0
+	utxoWrite         float64 = 0
+	utxoDelCount              = 0
+	utxoDel           float64 = 0
 	addressReadCount          = 0
 	addressRead       float64 = 0
 	addressWriteCount         = 0
 	addressWrite      float64 = 0
-
-	dummyScript = []byte{0, 0, 0, 0}
 )
 
 var addressMapping = make(map[string]struct{}, 5000000)
