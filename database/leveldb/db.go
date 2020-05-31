@@ -1,4 +1,4 @@
-package leveldb_go
+package leveldb
 
 import (
 	"github.com/qshuai/bitstate/database"

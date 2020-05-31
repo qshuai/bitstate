@@ -15,7 +15,7 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/qshuai/bitstate/database"
 	"github.com/qshuai/bitstate/database/bboltdb"
-	leveldb_go "github.com/qshuai/bitstate/database/leveldb"
+	"github.com/qshuai/bitstate/database/leveldb"
 	"github.com/qshuai/go-bitcoind"
 	"github.com/qshuai/lru"
 	"github.com/spf13/viper"
@@ -737,7 +737,7 @@ func NewServer() (*Server, error) {
 
 	case database.LeveldbDriver:
 		dbPath := viper.GetString("server.db.leveldb.dbpath")
-		levelDB, err := leveldb_go.New(dbPath, &opt.Options{})
+		levelDB, err := leveldb.New(dbPath, &opt.Options{})
 		if err != nil {
 			return nil, err
 		}
@@ -766,20 +766,21 @@ func NewServer() (*Server, error) {
 		return nil, errors.New("the tcp connection to bitcoin core unreached: " + err.Error())
 	}
 
-	utxoCacheSize = viper.GetInt("server.cache.utxo")
-	addressCacheSize = viper.GetInt("server.cache.address")
+	// todo<qshuai> set defalult value
+	utxoCacheSize := viper.GetInt("server.cache.utxo")
+	addressCacheSize := viper.GetInt("server.cache.address")
 
 	s := &Server{
 		db:             db,
 		addressDB:      addressListDB,
 		rpcBackend:     bc,
 		blockContainer: make(chan *Block, blockCacheSize),
-		utxoCache:      lru.New(utxoCacheSize, true),
-		addressCache:   lru.New(addressCacheSize, false),
+		utxoCache:      lru.New(utxoCacheSize, false),
+		addressCache:   lru.New(addressCacheSize, true),
 
 		endBlock: viper.GetInt("server.task.end"),
 
-		done: make(chan bool, blockCacheSize),
+		done: make(chan bool, 1),
 	}
 	s.closed.Store(false)
 	s.utxoCache.Callback = s.carryUtxoCache
