@@ -73,6 +73,8 @@ type Server struct {
 
 	closed atomic.Value
 	done   chan bool
+
+	wg sync.WaitGroup
 }
 
 func (s *Server) syncBlocks() {
@@ -626,6 +628,8 @@ func (s *Server) stop() {
 	if err != nil {
 		log.Errorf("close database failed: %s", err)
 	}
+	
+	s.wg.Done()
 }
 
 func generateUtxoKey(txHash *chainhash.Hash, idx uint32) []byte {
@@ -777,8 +781,12 @@ func NewServer() (*Server, error) {
 		endBlock: viper.GetInt("server.task.end"),
 
 		done: make(chan bool, 1),
+		wg:   sync.WaitGroup{},
 	}
 	server.closed.Store(false)
+	// exit before flush all cache
+	server.wg.Add(1)
+
 	server.utxoCache.Callback = server.carryUtxoCache
 	server.addressCache.Callback = server.carryAddressCache
 

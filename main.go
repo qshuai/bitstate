@@ -93,4 +93,6 @@ func main() {
 	}
 
 	server.start()
+
+	server.wg.Wait()
 }
