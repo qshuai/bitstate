@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btclog"
 	"github.com/spf13/viper"
 )
@@ -22,11 +21,6 @@ const (
 var (
 	log btclog.Logger
 )
-
-type Block struct {
-	block  *wire.MsgBlock
-	height uint32
-}
 
 func main() {
 	{
@@ -93,6 +87,4 @@ func main() {
 	}
 
 	server.start()
-
-	server.wg.Wait()
 }

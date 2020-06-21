@@ -48,6 +48,11 @@ var (
 
 var addressMapping = make(map[string]struct{}, 5000000)
 
+type Block struct {
+	block  *wire.MsgBlock
+	height uint32
+}
+
 type Server struct {
 	bestHeight int
 
@@ -73,9 +78,6 @@ type Server struct {
 	endBlock   int
 
 	closed atomic.Value
-	done   chan bool
-
-	wg sync.WaitGroup
 }
 
 func (s *Server) syncBlocks() {
@@ -103,7 +105,6 @@ func (s *Server) syncBlocks() {
 	for i := s.startBlock; i <= s.endBlock; i++ {
 		if s.closed.Load().(bool) {
 			log.Info("[block sync]Receiving shutdown requested")
-			s.done <- true
 			return
 		}
 
@@ -143,6 +144,8 @@ func (s *Server) syncBlocks() {
 }
 
 func (s *Server) start() {
+	defer s.flushCache()
+
 	// the goroutine be responsible for get block and put to cache
 	go s.syncBlocks()
 
@@ -153,13 +156,13 @@ func (s *Server) start() {
 		select {
 		case block, ok = <-s.blockContainer:
 			if !ok {
+				// notify close event to syncing block goroutine
+				s.closed.Store(true)
+
 				// the producer has been closed
 				log.Info("Handler block completed")
-				s.stop()
 				return
 			}
-		case <-s.done:
-			return
 		}
 
 		inputs, outputs = 0, 0
@@ -416,13 +419,32 @@ func (s *Server) flushAddressLRUCache(item lru.Item) error {
 	return s.db.Put(addressBucket, key, value)
 }
 
-func (s *Server) flushCache() error {
-	err := s.utxoCache.Iterate()
+func (s *Server) flushCache() {
+	var err error
+	defer func() {
+		err = s.db.Shutdown()
+		if err != nil {
+			log.Errorf("close database failed: %s", err)
+		}
+	}()
+
+	err = s.utxoCache.Iterate()
 	if err != nil {
-		return err
+		log.Errorf("flush utxo cache failed: %s", err)
 	}
 
-	return s.addressCache.Iterate()
+	err = s.addressCache.Iterate()
+	if err != nil {
+		log.Errorf("flush address cache failed: %s", err)
+	}
+
+	log.Infof("write the best block height: %d", s.bestHeight)
+	err = s.db.Put(nil, bestHeightKey, []byte(strconv.Itoa(s.bestHeight)))
+	if err != nil {
+		log.Errorf("write the best block height failed: %s", err)
+	}
+
+	log.Info("Flush cache completed!")
 }
 
 func (s *Server) spend(txHash *chainhash.Hash, view *UtxoView, payment map[string]int64) error {
@@ -618,27 +640,6 @@ func (s *Server) receiveCoin(txHash *chainhash.Hash, view *UtxoView, amountDiff 
 
 func (s *Server) stop() {
 	s.closed.Store(true)
-
-	log.Info("Flush cache before exiting")
-	err := s.flushCache()
-	if err != nil {
-		log.Errorf("flush utxo and address cache failed: %s", err)
-	}
-
-	log.Infof("write the best block height: %d", s.bestHeight)
-	err = s.db.Put(nil, bestHeightKey, []byte(strconv.Itoa(s.bestHeight)))
-	if err != nil {
-		log.Errorf("write the best block height failed: %s", err)
-	}
-
-	log.Info("Flush cache completed!")
-
-	err = s.db.Shutdown()
-	if err != nil {
-		log.Errorf("close database failed: %s", err)
-	}
-
-	s.wg.Done()
 }
 
 func generateUtxoKey(txHash *chainhash.Hash, idx uint32) []byte {
@@ -661,9 +662,9 @@ func (s *Server) generateAddressKey(script []byte) ([]byte, string, bool, error)
 	// shorten hash
 	sum := sha256.Sum256(script)
 	target := sum[:6]
-	//_, err := s.addressDB.Get(addressListBucket, target)
-	//existed := true
-	//if err != nil {
+	// _, err := s.addressDB.Get(addressListBucket, target)
+	// existed := true
+	// if err != nil {
 	//	if err == database.ErrNotFound {
 	//		// store
 	//		err = s.addressDB.Put(addressListBucket, target, script)
@@ -674,7 +675,7 @@ func (s *Server) generateAddressKey(script []byte) ([]byte, string, bool, error)
 	//	} else {
 	//		return nil, "", false, err
 	//	}
-	//}
+	// }
 	key := hex.EncodeToString(target)
 	_, ok := addressMapping[key]
 	existed := true
@@ -777,7 +778,7 @@ func NewServer() (*Server, error) {
 		return nil, errors.New("the tcp connection to bitcoin core unreached: " + err.Error())
 	}
 
-	// todo<qshuai> set defalult value
+	// todo<qshuai> set default value
 	utxoCacheSize := viper.GetInt("server.cache.utxo")
 	addressCacheSize := viper.GetInt("server.cache.address")
 
@@ -790,13 +791,8 @@ func NewServer() (*Server, error) {
 		addressCache:   lru.New(addressCacheSize, true),
 
 		endBlock: viper.GetInt("server.task.end"),
-
-		done: make(chan bool, 1),
-		wg:   sync.WaitGroup{},
 	}
 	server.closed.Store(false)
-	// exit before flush all cache
-	server.wg.Add(1)
 
 	server.utxoCache.Callback = server.carryUtxoCache
 	server.addressCache.Callback = server.carryAddressCache
