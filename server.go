@@ -93,6 +93,13 @@ func (s *Server) syncBlocks() {
 	// sync blockHeader
 	if s.startBlock != 0 {
 		for i := 0; i < s.startBlock; i++ {
+			select {
+			case <-s.interrupt:
+				return
+			default:
+
+			}
+
 			blockHeader, err := s.getBlockHeader(i)
 			if err != nil {
 				return
@@ -655,6 +662,7 @@ func (s *Server) stop() {
 	select {
 	case s.interrupt <- struct{}{}:
 	case <-time.After(blockSyncTimeout):
+		log.Warnf("waiting block sync receiving signal timeout")
 	}
 }
 
