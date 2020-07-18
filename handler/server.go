@@ -1,4 +1,4 @@
-package main
+package handler
 
 import (
 	"bytes"
@@ -16,6 +16,9 @@ import (
 	"github.com/qshuai/bitstate/database"
 	"github.com/qshuai/bitstate/database/bboltdb"
 	"github.com/qshuai/bitstate/database/leveldb"
+	"github.com/qshuai/bitstate/logging"
+	"github.com/qshuai/bitstate/script"
+	"github.com/qshuai/bitstate/utils"
 	"github.com/qshuai/go-bitcoind"
 	"github.com/qshuai/lru"
 	"github.com/spf13/viper"
@@ -23,6 +26,8 @@ import (
 	"github.com/syndtr/goleveldb/leveldb/opt"
 	"go.etcd.io/bbolt"
 )
+
+var log logging.Logging
 
 var (
 	addressBucket     = []byte("a")
@@ -45,6 +50,11 @@ var (
 	addressRead       float64 = 0
 	addressWriteCount         = 0
 	addressWrite      float64 = 0
+)
+
+const (
+	// blockCacheSize the channel holds the number of block.
+	blockCacheSize = 5
 )
 
 var addressMapping = make(map[string]struct{}, 5000000)
@@ -158,7 +168,7 @@ func (s *Server) syncBlocks() {
 	}
 }
 
-func (s *Server) start() {
+func (s *Server) Start() {
 	defer func() {
 		select {
 		case s.handleFail <- struct{}{}:
@@ -219,7 +229,7 @@ func (s *Server) start() {
 			}
 
 			for idx, output := range tx.TxOut {
-				if isNullDataOutput(output.PkScript) {
+				if script.IsNullDataOutput(output.PkScript) {
 					continue
 				}
 
@@ -300,7 +310,7 @@ func (s *Server) fetchPayment(tx *wire.MsgTx) (map[string]int64, []*UtxoView, er
 		// cache fetched utxoview
 		viewCache[idx] = view
 
-		scripts, err := generateCanonicalScript(getSafeScript(view.pkScript))
+		scripts, err := script.GenerateCanonicalScript(getSafeScript(view.pkScript))
 		if err != nil {
 			return nil, nil, err
 		}
@@ -319,7 +329,7 @@ func (s *Server) fetchPayment(tx *wire.MsgTx) (map[string]int64, []*UtxoView, er
 	}
 
 	for _, output := range tx.TxOut {
-		scripts, err := generateCanonicalScript(getSafeScript(output.PkScript))
+		scripts, err := script.GenerateCanonicalScript(getSafeScript(output.PkScript))
 		if err != nil {
 			return nil, nil, err
 		}
@@ -468,7 +478,7 @@ func (s *Server) flushCache() {
 }
 
 func (s *Server) spend(txHash *chainhash.Hash, view *UtxoView, payment map[string]int64) error {
-	scripts, err := generateCanonicalScript(getSafeScript(view.pkScript))
+	scripts, err := script.GenerateCanonicalScript(getSafeScript(view.pkScript))
 	if err != nil {
 		return err
 	}
@@ -551,7 +561,7 @@ func (s *Server) spendCoin(txHash *chainhash.Hash, view *UtxoView, amountDiff in
 }
 
 func (s *Server) receive(txHash *chainhash.Hash, view *UtxoView, payment map[string]int64) error {
-	scripts, err := generateCanonicalScript(getSafeScript(view.pkScript))
+	scripts, err := script.GenerateCanonicalScript(getSafeScript(view.pkScript))
 	if err != nil {
 		return err
 	}
@@ -658,7 +668,7 @@ func (s *Server) receiveCoin(txHash *chainhash.Hash, view *UtxoView, amountDiff 
 	return nil
 }
 
-func (s *Server) stop() {
+func (s *Server) Stop() {
 	select {
 	case s.interrupt <- struct{}{}:
 	case <-time.After(blockSyncTimeout):
@@ -667,8 +677,8 @@ func (s *Server) stop() {
 }
 
 func generateUtxoKey(txHash *chainhash.Hash, idx uint32) []byte {
-	shash := shortHash(txHash)
-	index := CompressedUint32(idx)
+	shash := script.ShortHash(txHash)
+	index := utils.CompressedUint32(idx)
 
 	buf := bytes.NewBuffer(make([]byte, 0, len(shash)+len(index)))
 	buf.Write(shash)
@@ -740,7 +750,9 @@ func newAddressListDB() (database.DB, error) {
 	return bboltDB, nil
 }
 
-func NewServer() (*Server, error) {
+func NewServer(logging logging.Logging) (*Server, error) {
+	log = logging
+
 	driverName := viper.GetString("server.db.driver")
 	driver, ok := database.GetDriver(driverName)
 	if !ok {

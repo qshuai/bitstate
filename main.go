@@ -8,14 +8,12 @@ import (
 	"syscall"
 
 	"github.com/btcsuite/btclog"
+	"github.com/qshuai/bitstate/handler"
 	"github.com/spf13/viper"
 )
 
 const (
 	logFile = "bitstate.log"
-
-	// blockCacheSize the channel holds the number of block.
-	blockCacheSize = 5
 )
 
 var (
@@ -67,7 +65,7 @@ func main() {
 	}
 
 	// get server instance
-	server, err := NewServer()
+	server, err := handler.NewServer(log)
 	if err != nil {
 		log.Errorf("New server instance failed: %s", err)
 		os.Exit(1)
@@ -81,10 +79,10 @@ func main() {
 			select {
 			case <-interrupt:
 				log.Info("Receiving interrupt signal, preparing exit program")
-				server.stop()
+				server.Stop()
 			}
 		}()
 	}
 
-	server.start()
+	server.Start()
 }

@@ -1,4 +1,4 @@
-package main
+package script
 
 // MaxDataCarrierSize is the maximum number of bytes allowed in pushed
 // data to be considered a nulldata transaction

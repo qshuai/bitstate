@@ -1,4 +1,4 @@
-package main
+package handler
 
 type UtxoViewCache struct {
 	// compressed hexadecimal string of the short hash and index

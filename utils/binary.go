@@ -1,4 +1,4 @@
-package main
+package utils
 
 func PutUint8(v uint8) []byte {
 	return []byte{v}

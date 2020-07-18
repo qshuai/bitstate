@@ -1,15 +1,16 @@
-package main
+package script
 
 import (
 	"encoding/hex"
 	"errors"
+	"fmt"
 
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcutil"
 )
 
-func shortHash(txHash *chainhash.Hash) []byte {
+func ShortHash(txHash *chainhash.Hash) []byte {
 	if txHash == nil {
 		return nil
 	}
@@ -17,7 +18,7 @@ func shortHash(txHash *chainhash.Hash) []byte {
 	return txHash[chainhash.HashSize-6:]
 }
 
-func isNullDataOutput(pkscript []byte) bool {
+func IsNullDataOutput(pkscript []byte) bool {
 	if pkscript != nil && len(pkscript) > 0 && pkscript[0] == txscript.OP_RETURN {
 		// todo record lost coin
 		return true
@@ -26,7 +27,7 @@ func isNullDataOutput(pkscript []byte) bool {
 	return false
 }
 
-func generateCanonicalScript(pkScript []byte) ([][]byte, error) {
+func GenerateCanonicalScript(pkScript []byte) ([][]byte, error) {
 	if pkScript == nil || len(pkScript) == 0 {
 		return nil, errors.New("nil or empty lock script")
 	}
@@ -34,7 +35,7 @@ func generateCanonicalScript(pkScript []byte) ([][]byte, error) {
 	ret, err := parseScript(pkScript)
 	if err != nil {
 		// ignore nostandard script
-		log.Warnf("parse script failed for script: %s, reasmon: %s",
+		fmt.Printf("parse script failed for script: %s, reasmon: %s",
 			hex.EncodeToString(pkScript), err.Error())
 		return [][]byte{pkScript}, nil
 	}

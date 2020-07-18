@@ -1,10 +1,11 @@
-package main
+package handler
 
 import (
 	"bytes"
 	"encoding/binary"
 
 	"github.com/btcsuite/btcd/wire"
+	"github.com/qshuai/bitstate/utils"
 )
 
 const (
@@ -27,12 +28,12 @@ func (view *UtxoView) encode() ([]byte, error) {
 	container := make([]byte, 0, 4+8+1+varLen+len(view.pkScript))
 
 	w := bytes.NewBuffer(container)
-	w.Write(PutUint32(view.compactCoinbaseAndHeight()))
-	w.Write(PutUint64(uint64(view.amount)))
+	w.Write(utils.PutUint32(view.compactCoinbaseAndHeight()))
+	w.Write(utils.PutUint64(uint64(view.amount)))
 	if view.spent {
-		w.Write(PutUint8(SpendTag))
+		w.Write(utils.PutUint8(SpendTag))
 	} else {
-		w.Write(PutUint8(UnSpendTag))
+		w.Write(utils.PutUint8(UnSpendTag))
 	}
 	err := wire.WriteVarInt(w, 0, uint64(varLen))
 	if err != nil {
