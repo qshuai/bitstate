@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/btcsuite/btcd/blockchain"
@@ -32,6 +31,8 @@ var (
 	bestHeightKey     = []byte("bestheight")
 
 	dummyScript = []byte{0, 0, 0, 0}
+
+	blockSyncTimeout = 5 * time.Second
 
 	// the following items are trace indicator
 	utxoReadCount             = 0
@@ -77,7 +78,8 @@ type Server struct {
 	startBlock int
 	endBlock   int
 
-	closed atomic.Value
+	interrupt  chan struct{}
+	handleFail chan struct{}
 }
 
 func (s *Server) syncBlocks() {
@@ -103,9 +105,15 @@ func (s *Server) syncBlocks() {
 	}
 
 	for i := s.startBlock; i <= s.endBlock; i++ {
-		if s.closed.Load().(bool) {
-			log.Info("[block sync]Receiving shutdown requested")
+		select {
+		case <-s.interrupt:
+			log.Info("[block sync] receiving interrupt signal")
 			return
+		case <-s.handleFail:
+			log.Info("[block sync] receiving stop signal from block handler")
+			return
+		default:
+			// keep going
 		}
 
 		blockheader, err := s.getBlockHeader(i)
@@ -144,7 +152,15 @@ func (s *Server) syncBlocks() {
 }
 
 func (s *Server) start() {
-	defer s.flushCache()
+	defer func() {
+		select {
+		case s.handleFail <- struct{}{}:
+		case <-time.After(blockSyncTimeout):
+			log.Warn("waiting block sync goroutine exit timeout")
+		}
+
+		s.flushCache()
+	}()
 
 	// the goroutine be responsible for get block and put to cache
 	go s.syncBlocks()
@@ -156,11 +172,8 @@ func (s *Server) start() {
 		select {
 		case block, ok = <-s.blockContainer:
 			if !ok {
-				// notify close event to syncing block goroutine
-				s.closed.Store(true)
-
 				// the producer has been closed
-				log.Info("Handler block completed")
+				log.Info("block handler completed")
 				return
 			}
 		}
@@ -639,7 +652,10 @@ func (s *Server) receiveCoin(txHash *chainhash.Hash, view *UtxoView, amountDiff 
 }
 
 func (s *Server) stop() {
-	s.closed.Store(true)
+	select {
+	case s.interrupt <- struct{}{}:
+	case <-time.After(blockSyncTimeout):
+	}
 }
 
 func generateUtxoKey(txHash *chainhash.Hash, idx uint32) []byte {
@@ -790,9 +806,11 @@ func NewServer() (*Server, error) {
 		utxoCache:      lru.New(utxoCacheSize, false),
 		addressCache:   lru.New(addressCacheSize, true),
 
+		interrupt:  make(chan struct{}),
+		handleFail: make(chan struct{}),
+
 		endBlock: viper.GetInt("server.task.end"),
 	}
-	server.closed.Store(false)
 
 	server.utxoCache.Callback = server.carryUtxoCache
 	server.addressCache.Callback = server.carryAddressCache
