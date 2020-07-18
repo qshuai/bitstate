@@ -835,6 +835,7 @@ func NewServer() (*Server, error) {
 			return nil, errors.New("invalid number(block height)")
 		}
 		server.startBlock = bestHeight + 1
+		server.bestHeight = bestHeight
 	}
 	log.Infof("bitstate will sync from block height: %d", server.startBlock)
 
