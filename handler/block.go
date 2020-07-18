@@ -64,7 +64,7 @@ type Block struct {
 	height uint32
 }
 
-type Server struct {
+type BlockHandler struct {
 	bestHeight int
 
 	// db stores utxo and address info
@@ -92,7 +92,7 @@ type Server struct {
 	handleFail chan struct{}
 }
 
-func (s *Server) syncBlocks() {
+func (s *BlockHandler) syncBlocks() {
 	defer func() {
 		// the channel should be closed by producer
 		close(s.blockContainer)
@@ -168,7 +168,7 @@ func (s *Server) syncBlocks() {
 	}
 }
 
-func (s *Server) Start() {
+func (s *BlockHandler) Start() {
 	defer func() {
 		select {
 		case s.handleFail <- struct{}{}:
@@ -267,7 +267,7 @@ func (s *Server) Start() {
 	}
 }
 
-func (s *Server) getBlockHeader(blockHeight int) (*bitcoind.BlockHeader, error) {
+func (s *BlockHandler) getBlockHeader(blockHeight int) (*bitcoind.BlockHeader, error) {
 	// todo<qshuai> fetch headers by local file firstly
 
 	blockHash, err := s.rpcBackend.GetBlockHash(uint64(blockHeight))
@@ -292,7 +292,7 @@ func (s *Server) getBlockHeader(blockHeight int) (*bitcoind.BlockHeader, error) 
 // The amount will be a positive number if an address receiving some coin. On
 // the contrary, the amount will be a negative number if an address spending some
 // coin.
-func (s *Server) fetchPayment(tx *wire.MsgTx) (map[string]int64, []*UtxoView, error) {
+func (s *BlockHandler) fetchPayment(tx *wire.MsgTx) (map[string]int64, []*UtxoView, error) {
 	payment := make(map[string]int64)
 	viewCache := make([]*UtxoView, len(tx.TxIn))
 
@@ -350,7 +350,7 @@ func (s *Server) fetchPayment(tx *wire.MsgTx) (map[string]int64, []*UtxoView, er
 	return payment, viewCache, nil
 }
 
-func (s *Server) fetchUtxo(input *wire.TxIn) (*UtxoView, error) {
+func (s *BlockHandler) fetchUtxo(input *wire.TxIn) (*UtxoView, error) {
 	outpoint := input.PreviousOutPoint
 
 	utxoDBKey := generateUtxoKey(&outpoint.Hash, outpoint.Index)
@@ -395,7 +395,7 @@ func (s *Server) fetchUtxo(input *wire.TxIn) (*UtxoView, error) {
 	}
 }
 
-func (s *Server) carryUtxoCache(entry lru.Item) error {
+func (s *BlockHandler) carryUtxoCache(entry lru.Item) error {
 	view := entry.(*UtxoViewCache)
 	key, _ := hex.DecodeString(view.key)
 	value, err := view.entry.encode()
@@ -414,7 +414,7 @@ func (s *Server) carryUtxoCache(entry lru.Item) error {
 	return nil
 }
 
-func (s *Server) carryAddressCache(entry lru.Item) error {
+func (s *BlockHandler) carryAddressCache(entry lru.Item) error {
 	info := entry.(*AddressBalanceInfoCache)
 	key, _ := hex.DecodeString(info.key)
 	value := info.entry.Encode()
@@ -429,7 +429,7 @@ func (s *Server) carryAddressCache(entry lru.Item) error {
 	return nil
 }
 
-func (s *Server) flushUtxoLRUCache(item lru.Item) error {
+func (s *BlockHandler) flushUtxoLRUCache(item lru.Item) error {
 	view := item.(*UtxoViewCache)
 	key, _ := hex.DecodeString(view.key)
 	value, err := view.entry.encode()
@@ -441,7 +441,7 @@ func (s *Server) flushUtxoLRUCache(item lru.Item) error {
 	return err
 }
 
-func (s *Server) flushAddressLRUCache(item lru.Item) error {
+func (s *BlockHandler) flushAddressLRUCache(item lru.Item) error {
 	info := item.(*AddressBalanceInfoCache)
 	key, _ := hex.DecodeString(info.key)
 	value := info.entry.Encode()
@@ -449,7 +449,7 @@ func (s *Server) flushAddressLRUCache(item lru.Item) error {
 	return s.db.Put(addressBucket, key, value)
 }
 
-func (s *Server) flushCache() {
+func (s *BlockHandler) flushCache() {
 	var err error
 	defer func() {
 		err = s.db.Shutdown()
@@ -477,7 +477,7 @@ func (s *Server) flushCache() {
 	log.Info("Flush cache completed!")
 }
 
-func (s *Server) spend(txHash *chainhash.Hash, view *UtxoView, payment map[string]int64) error {
+func (s *BlockHandler) spend(txHash *chainhash.Hash, view *UtxoView, payment map[string]int64) error {
 	scripts, err := script.GenerateCanonicalScript(getSafeScript(view.pkScript))
 	if err != nil {
 		return err
@@ -541,7 +541,7 @@ func (s *Server) spend(txHash *chainhash.Hash, view *UtxoView, payment map[strin
 	return nil
 }
 
-func (s *Server) spendCoin(txHash *chainhash.Hash, view *UtxoView, amountDiff int64, info *AddressBalanceInfo) error {
+func (s *BlockHandler) spendCoin(txHash *chainhash.Hash, view *UtxoView, amountDiff int64, info *AddressBalanceInfo) error {
 	if info.bestTxHash != txHash.String() {
 		// update tx count and send/receive fields when meeting a different transaction
 		info.txes++
@@ -560,7 +560,26 @@ func (s *Server) spendCoin(txHash *chainhash.Hash, view *UtxoView, amountDiff in
 	return nil
 }
 
-func (s *Server) receive(txHash *chainhash.Hash, view *UtxoView, payment map[string]int64) error {
+type BestBlock struct {
+	Hash   string
+	Height int
+}
+
+func (s *BlockHandler) GetBestBlock() (*BestBlock, error) {
+	s.mtx.Lock()
+	header, ok := s.headers[uint32(s.bestHeight)]
+	s.mtx.Unlock()
+	if !ok {
+		return nil, errors.New("not found, please request again in a moment")
+	}
+
+	return &BestBlock{
+		Hash:   header.Hash,
+		Height: s.bestHeight,
+	}, nil
+}
+
+func (s *BlockHandler) receive(txHash *chainhash.Hash, view *UtxoView, payment map[string]int64) error {
 	scripts, err := script.GenerateCanonicalScript(getSafeScript(view.pkScript))
 	if err != nil {
 		return err
@@ -649,7 +668,7 @@ func (s *Server) receive(txHash *chainhash.Hash, view *UtxoView, payment map[str
 	return nil
 }
 
-func (s *Server) receiveCoin(txHash *chainhash.Hash, view *UtxoView, amountDiff int64, info *AddressBalanceInfo) error {
+func (s *BlockHandler) receiveCoin(txHash *chainhash.Hash, view *UtxoView, amountDiff int64, info *AddressBalanceInfo) error {
 	if info.bestTxHash != txHash.String() {
 		info.txes++
 		// when a address receiving the first coin, the create field should be maintained by method caller.
@@ -668,7 +687,7 @@ func (s *Server) receiveCoin(txHash *chainhash.Hash, view *UtxoView, amountDiff 
 	return nil
 }
 
-func (s *Server) Stop() {
+func (s *BlockHandler) Stop() {
 	select {
 	case s.interrupt <- struct{}{}:
 	case <-time.After(blockSyncTimeout):
@@ -687,7 +706,7 @@ func generateUtxoKey(txHash *chainhash.Hash, idx uint32) []byte {
 	return buf.Bytes()
 }
 
-func (s *Server) generateAddressKey(script []byte) ([]byte, string, bool, error) {
+func (s *BlockHandler) generateAddressKey(script []byte) ([]byte, string, bool, error) {
 	if len(script) <= 0 {
 		// todo confirm true
 		return dummyScript, hex.EncodeToString(getSafeScript(script)), true, nil
@@ -750,7 +769,7 @@ func newAddressListDB() (database.DB, error) {
 	return bboltDB, nil
 }
 
-func NewServer(logging logging.Logging) (*Server, error) {
+func NewServer(logging logging.Logging) (*BlockHandler, error) {
 	log = logging
 
 	driverName := viper.GetString("server.db.driver")
@@ -818,7 +837,7 @@ func NewServer(logging logging.Logging) (*Server, error) {
 	utxoCacheSize := viper.GetInt("server.cache.utxo")
 	addressCacheSize := viper.GetInt("server.cache.address")
 
-	server := &Server{
+	server := &BlockHandler{
 		db:             db,
 		addressDB:      addressListDB,
 		rpcBackend:     bc,
